@@ -190,8 +190,14 @@ def ensure_authenticated(email: str, password: str) -> None:
 # ---------------------------------------------------------------------------
 
 def web_get(path: str, **kwargs) -> dict | list:
-    """GET via connect.garmin.com web session (cookie-based)."""
-    resp = garth.client.sess.get(f"{CONNECT_BASE}{path}", **kwargs)
+    """GET via connect.garmin.com web session (cookie-based) with NK header."""
+    headers = kwargs.pop("headers", {})
+    headers.setdefault("NK", "NT")
+    resp = garth.client.sess.get(
+        f"{CONNECT_BASE}{path}",
+        headers=headers,
+        **kwargs,
+    )
     logger.debug(f"GET {path} → {resp.status_code} body={resp.text[:300]}")
     resp.raise_for_status()
     if not resp.content:
@@ -226,10 +232,12 @@ def comment_activity(activity_id: int) -> str | None:
 # Social feed & connections
 # ---------------------------------------------------------------------------
 
-def get_social_feed(max_activities: int = 100) -> list:
+def get_social_feed(max_activities: int = 200) -> list:
     paths = [
+        "/modern/proxy/activitylist-service/activities/subscriptionFeed",
+        "/modern/proxy/activitylist-service/activities/subscriptions",
+        "/proxy/activitylist-service/activities/subscriptionFeed",
         "/proxy/activitylist-service/activities/subscriptions",
-        "/proxy/activitylist-service/activities/following",
     ]
     page_size = 20
     for path in paths:
@@ -237,8 +245,6 @@ def get_social_feed(max_activities: int = 100) -> list:
         try:
             for start in range(0, max_activities, page_size):
                 raw = web_get(path, params={"start": start, "limit": page_size})
-                logger.debug(f"{path} start={start}: {str(raw)[:200]}")
-
                 if isinstance(raw, list):
                     page = raw
                 elif isinstance(raw, dict):
@@ -268,10 +274,10 @@ def get_connections() -> list:
         return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
 
     endpoints = [
+        "/modern/proxy/userprofile-service/socialProfile/connections",
+        "/modern/proxy/userprofile-service/socialProfile/followers",
+        "/modern/proxy/connection-service/connection/connected",
         "/proxy/userprofile-service/socialProfile/connections",
-        "/proxy/userprofile-service/socialProfile/followers",
-        "/proxy/userprofile-service/socialProfile/following",
-        "/proxy/connection-service/connection/connected",
     ]
     for ep in endpoints:
         try:
@@ -297,7 +303,7 @@ def get_connections() -> list:
 
 
 def get_colleague_activities(display_name: str, limit: int = 10) -> list:
-    path = f"/proxy/activitylist-service/activities/{display_name}"
+    path = f"/modern/proxy/activitylist-service/activities/{display_name}"
     try:
         data = web_get(path, params={"start": 0, "limit": limit})
         if isinstance(data, list):
