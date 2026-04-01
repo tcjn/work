@@ -95,7 +95,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garth.client.get("connect", "/proxy/userprofile-service/userprofile/personal-information", api=True)
+        garth.connectapi("/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -129,15 +129,15 @@ def comment_activity(activity_id: int) -> str | None:
 
 
 def garmin_get(path: str, **kwargs) -> dict | list:
-    return garth.client.get("connect", f"/proxy{path}", api=True, **kwargs).json()
+    return garth.connectapi(path, **kwargs)
 
 
 def garmin_put(path: str, **kwargs) -> None:
-    garth.client.put("connect", f"/proxy{path}", api=True, **kwargs)
+    garth.client.request("PUT", "connectapi", path, api=True, **kwargs)
 
 
 def garmin_post(path: str, **kwargs) -> None:
-    garth.client.post("connect", f"/proxy{path}", api=True, **kwargs)
+    garth.client.request("POST", "connectapi", path, api=True, **kwargs)
 
 
 def get_social_feed(max_activities: int = 100) -> list:
@@ -179,15 +179,23 @@ def get_social_feed(max_activities: int = 100) -> list:
 
 def get_connections() -> list:
     """Return list of connections (people you follow)."""
-    try:
-        data = garmin_get("/userprofile-service/socialProfile/connections", params={"start": 0, "limit": 100})
-        logger.debug(f"Connections raw: {str(data)[:500]}")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("connections", data.get("userConnections", []))
-    except Exception as e:
-        logger.warning(f"Failed to fetch connections: {e}")
+    endpoints = [
+        "/userprofile-service/socialProfile/connections",
+        "/userprofile-service/profile/social-profile/connections",
+        "/connection-service/connection/connected",
+    ]
+    for ep in endpoints:
+        try:
+            data = garmin_get(ep, params={"start": 0, "limit": 100})
+            logger.info(f"Connections from {ep}: {str(data)[:300]}")
+            if isinstance(data, list) and data:
+                return data
+            if isinstance(data, dict):
+                for key in ("connections", "userConnections", "connectionsList"):
+                    if data.get(key):
+                        return data[key]
+        except Exception as e:
+            logger.warning(f"Connections endpoint {ep} failed: {e}")
     return []
 
 
