@@ -173,56 +173,106 @@ def get_social_feed(max_activities: int = 100) -> list:
     return []
 
 
+def get_connections() -> list:
+    """Return list of display names of people you follow."""
+    try:
+        resp = garth.client.get(
+            "https://connect.garmin.com/proxy/userprofile-service/socialProfile/connections",
+            params={"start": 0, "limit": 100},
+        )
+        data = resp.json()
+        logger.debug(f"Connections raw: {str(data)[:500]}")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("connections", data.get("userConnections", []))
+    except Exception as e:
+        logger.warning(f"Failed to fetch connections: {e}")
+    return []
+
+
+def get_colleague_activities(display_name: str, limit: int = 10) -> list:
+    try:
+        resp = garth.client.get(
+            f"https://connect.garmin.com/proxy/activitylist-service/activities/{display_name}",
+            params={"start": 0, "limit": limit},
+        )
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("activityList", data.get("activities", []))
+    except Exception as e:
+        logger.warning(f"Failed to fetch activities for {display_name}: {e}")
+    return []
+
+
+def like_activity(activity: dict, owner: str, liked: set) -> set:
+    activity_id = activity.get("activityId")
+    if not activity_id or activity_id in liked:
+        return liked
+    if activity.get("userKudoed", False):
+        liked.add(activity_id)
+        return liked
+
+    activity_name = activity.get("activityName", "—")
+    activity_type = activity.get("activityType", {}).get("typeKey", "unknown") if isinstance(activity.get("activityType"), dict) else activity.get("activityType", "unknown")
+    activity_date = activity.get("startTimeLocal") or activity.get("beginTimestamp", "—")
+
+    logger.info(f"Processing: [{activity_type}] \"{activity_name}\" by {owner} on {activity_date}")
+    time.sleep(random.uniform(3, 10))
+
+    if kudo_activity(activity_id):
+        liked.add(activity_id)
+        save_liked_activities(liked)
+
+        comment = None
+        if ADD_COMMENTS:
+            time.sleep(random.uniform(2, 5))
+            comment = comment_activity(activity_id)
+
+        append_history({
+            "liked_at": datetime.now(timezone.utc).isoformat(),
+            "activity_id": activity_id,
+            "owner": owner,
+            "activity_name": activity_name,
+            "activity_type": activity_type,
+            "activity_date": activity_date,
+            "comment": comment,
+        })
+        logger.info(
+            f"✓ Liked [{activity_type}] \"{activity_name}\" by {owner}"
+            + (f" | comment: {comment}" if comment else "")
+        )
+    return liked
+
+
 def process_feed(liked: set) -> set:
     logger.info("Fetching social feed...")
     activities = get_social_feed()
     logger.info(f"Found {len(activities)} activities in feed")
 
+    new_likes = 0
     for activity in activities:
-        activity_id = activity.get("activityId")
         owner = activity.get("ownerDisplayName", "unknown")
-        activity_name = activity.get("activityName", "—")
-        activity_type = activity.get("activityType", {}).get("typeKey", "unknown") if isinstance(activity.get("activityType"), dict) else activity.get("activityType", "unknown")
-        activity_date = activity.get("startTimeLocal") or activity.get("beginTimestamp", "—")
+        before = len(liked)
+        liked = like_activity(activity, owner, liked)
+        if len(liked) > before:
+            new_likes += 1
 
-        if not activity_id:
-            continue
-
-        if activity_id in liked:
-            logger.debug(f"Already liked: {activity_id} by {owner}")
-            continue
-
-        if activity.get("userKudoed", False):
-            liked.add(activity_id)
-            continue
-
-        logger.info(f"Processing: [{activity_type}] \"{activity_name}\" by {owner} on {activity_date}")
-        time.sleep(random.uniform(3, 10))
-
-        if kudo_activity(activity_id):
-            liked.add(activity_id)
-            save_liked_activities(liked)
-
-            comment = None
-            if ADD_COMMENTS:
-                time.sleep(random.uniform(2, 5))
-                comment = comment_activity(activity_id)
-
-            now = datetime.now(timezone.utc).isoformat()
-            entry = {
-                "liked_at": now,
-                "activity_id": activity_id,
-                "owner": owner,
-                "activity_name": activity_name,
-                "activity_type": activity_type,
-                "activity_date": activity_date,
-                "comment": comment,
-            }
-            append_history(entry)
-            logger.info(
-                f"✓ Liked [{activity_type}] \"{activity_name}\" by {owner}"
-                + (f" | comment: {comment}" if comment else "")
-            )
+    if new_likes == 0:
+        logger.info("No new activities to like in feed — falling back to last 10 activities per colleague")
+        connections = get_connections()
+        logger.info(f"Found {len(connections)} connections")
+        for conn in connections:
+            display_name = conn.get("displayName") or conn.get("userProfileId")
+            full_name = conn.get("fullName") or display_name
+            if not display_name:
+                continue
+            colleague_activities = get_colleague_activities(str(display_name))
+            logger.info(f"  {full_name}: {len(colleague_activities)} activities fetched")
+            for activity in colleague_activities:
+                liked = like_activity(activity, full_name, liked)
 
     return liked
 
