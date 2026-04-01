@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 
 import garth
+import requests as req_lib
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -95,7 +96,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garth.client.request("GET", "/proxy/userprofile-service/userprofile/personal-information")
+        garmin_get("/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -108,7 +109,7 @@ def ensure_authenticated(email: str, password: str) -> None:
 
 def kudo_activity(activity_id: int) -> bool:
     try:
-        garth.client.request("PUT", f"/proxy/activity-service/activity/{activity_id}/kudos")
+        garmin_put(f"/activity-service/activity/{activity_id}/kudos")
         return True
     except Exception as e:
         logger.warning(f"Failed to like activity {activity_id}: {e}")
@@ -118,9 +119,8 @@ def kudo_activity(activity_id: int) -> bool:
 def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     try:
-        garth.client.request(
-            "POST",
-            f"/proxy/comment-service/comment/activity/{activity_id}",
+        garmin_post(
+            f"/comment-service/comment/activity/{activity_id}",
             json={"comment": comment},
         )
         return comment
@@ -129,14 +129,31 @@ def comment_activity(activity_id: int) -> str | None:
         return None
 
 
-def garmin_request(method: str, path: str, **kwargs) -> dict | list:
-    """Authenticated request to connect.garmin.com."""
-    resp = garth.client.request(method, f"/proxy{path}", **kwargs)
-    return resp.json()
+GARMIN_BASE = "https://connect.garmin.com/proxy"
+
+
+def _auth_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {garth.client.oauth2_token.access_token}",
+        "NK": "NT",
+        "Accept": "application/json",
+    }
 
 
 def garmin_get(path: str, **kwargs) -> dict | list:
-    return garmin_request("GET", path, **kwargs)
+    resp = req_lib.get(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def garmin_put(path: str, **kwargs) -> None:
+    resp = req_lib.put(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
+    resp.raise_for_status()
+
+
+def garmin_post(path: str, **kwargs) -> None:
+    resp = req_lib.post(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
+    resp.raise_for_status()
 
 
 def get_social_feed(max_activities: int = 100) -> list:
