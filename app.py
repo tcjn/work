@@ -180,37 +180,8 @@ def get_social_feed(max_activities: int = 100) -> list:
 
 
 def get_connections() -> list:
-    """Return display names of connections, from API or manual config."""
-    if MANUAL_COLLEAGUES:
-        logger.info(f"Using manually configured colleagues: {MANUAL_COLLEAGUES}")
-        return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
-
-    username = garth.client.username
-    logger.info(f"Discovering connections for user: {username}")
-
-    endpoints = [
-        f"/userprofile-service/socialProfile/{username}/connections",
-        "/userprofile-service/socialProfile/connections",
-        "/connection-service/connection/connected",
-    ]
-    for ep in endpoints:
-        try:
-            data = garmin_get(ep, params={"start": 0, "limit": 100})
-            logger.info(f"Connections [{ep}]: {str(data)[:200]}")
-            if isinstance(data, list) and data:
-                return data
-            if isinstance(data, dict):
-                for key in ("connections", "userConnections", "connectionsList"):
-                    if data.get(key):
-                        return data[key]
-        except Exception as e:
-            logger.warning(f"Connections endpoint {ep} failed: {e}")
-
-    logger.warning(
-        "No connections found via API. "
-        "Set GARMIN_COLLEAGUES=displayname1,displayname2 in .env to specify colleagues manually."
-    )
-    return []
+    """Return list of colleague dicts from manual config."""
+    return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
 
 
 def get_colleague_activities(display_name: str, limit: int = 10) -> list:
@@ -312,7 +283,14 @@ def main():
         logger.error(f"Login failed: {e}")
         raise SystemExit(1)
 
-    logger.info(f"Garmin username: {garth.client.username}")
+    if MANUAL_COLLEAGUES:
+        logger.info(f"Colleagues configured: {MANUAL_COLLEAGUES}")
+    else:
+        logger.warning(
+            "GARMIN_COLLEAGUES is not set. Auto-discovery is not supported. "
+            "Add GARMIN_COLLEAGUES=displayname1,displayname2 to your .env file. "
+            "Find display names in Garmin Connect profile URLs."
+        )
     liked = load_liked_activities()
     logger.info(f"Loaded {len(liked)} previously liked activities")
 
