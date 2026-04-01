@@ -120,26 +120,40 @@ def comment_activity(activity_id: int) -> bool:
         return False
 
 
-def get_social_feed(limit: int = 20) -> list:
+def get_social_feed(max_activities: int = 100) -> list:
     endpoints = [
         "/activitylist-service/activities/subscriptions",
         "/activitylist-service/activities/following",
     ]
+    page_size = 20
     for endpoint in endpoints:
+        collected = []
         try:
-            raw = garth.connectapi(endpoint, params={"start": 0, "limit": limit})
-            logger.debug(f"Raw response from {endpoint}: {str(raw)[:500]}")
-            if isinstance(raw, list):
-                if raw:
-                    logger.info(f"Feed endpoint: {endpoint}")
-                    return raw
-            elif isinstance(raw, dict):
-                for key in ("activityList", "activities", "items"):
-                    if raw.get(key):
-                        logger.info(f"Feed endpoint: {endpoint}, key: {key}")
-                        return raw[key]
+            for start in range(0, max_activities, page_size):
+                raw = garth.connectapi(endpoint, params={"start": start, "limit": page_size})
+                logger.debug(f"Raw response from {endpoint} start={start}: {str(raw)[:500]}")
+
+                if isinstance(raw, list):
+                    page = raw
+                elif isinstance(raw, dict):
+                    page = next(
+                        (raw[k] for k in ("activityList", "activities", "items") if raw.get(k)),
+                        [],
+                    )
+                else:
+                    page = []
+
+                collected.extend(page)
+
+                if len(page) < page_size:
+                    break  # no more pages
+
+            if collected:
+                logger.info(f"Feed endpoint: {endpoint}, total activities: {len(collected)}")
+                return collected
         except Exception as e:
             logger.warning(f"Endpoint {endpoint} failed: {e}")
+
     logger.warning("All feed endpoints returned 0 activities. Check that you follow people on Garmin Connect.")
     return []
 
