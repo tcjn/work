@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import random
 import logging
@@ -39,17 +40,23 @@ POLISH_COMMENTS = [
 ]
 
 LIKED_ACTIVITIES_FILE = "/data/liked_activities.json"
-HISTORY_FILE = "/data/history.json"
-TOKEN_STORE = "/data/tokens"
+HISTORY_FILE           = "/data/history.json"
+TOKEN_STORE            = "/data/tokens"
+COOKIES_FILE           = "/data/connect_cookies.json"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
-ADD_COMMENTS = os.getenv("ADD_COMMENTS", "true").lower() == "true"
-# Comma-separated Garmin Connect display names to like manually, e.g. "john.doe,jane.smith"
-MANUAL_COLLEAGUES = [c.strip() for c in os.getenv("GARMIN_COLLEAGUES", "").split(",") if c.strip()]
+ADD_COMMENTS           = os.getenv("ADD_COMMENTS", "true").lower() == "true"
+MANUAL_COLLEAGUES      = [c.strip() for c in os.getenv("GARMIN_COLLEAGUES", "").split(",") if c.strip()]
 
+CONNECT_BASE = "https://connect.garmin.com"
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
 
 def load_liked_activities() -> set:
     try:
-        with open(LIKED_ACTIVITIES_FILE, "r") as f:
+        with open(LIKED_ACTIVITIES_FILE) as f:
             return set(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
@@ -64,13 +71,75 @@ def save_liked_activities(liked: set) -> None:
 def append_history(entry: dict) -> None:
     os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
     try:
-        with open(HISTORY_FILE, "r") as f:
+        with open(HISTORY_FILE) as f:
             history = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         history = []
     history.append(entry)
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def save_connect_cookies() -> None:
+    os.makedirs(os.path.dirname(COOKIES_FILE), exist_ok=True)
+    cookies = {
+        c.name: c.value
+        for c in garth.client.sess.cookies
+        if "garmin.com" in (c.domain or "")
+    }
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f)
+
+
+def load_connect_cookies() -> bool:
+    try:
+        with open(COOKIES_FILE) as f:
+            cookies = json.load(f)
+        for name, value in cookies.items():
+            garth.client.sess.cookies.set(name, value)
+        return bool(cookies)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def setup_connect_web_session() -> bool:
+    """Exchange the existing SSO session for a connect.garmin.com session cookie."""
+    try:
+        # Ask SSO for a service ticket for connect.garmin.com using existing cookies
+        resp = garth.client.sess.get(
+            "https://sso.garmin.com/sso/login",
+            params={
+                "service": "https://connect.garmin.com/modern",
+                "gauthHost": "https://sso.garmin.com/sso",
+                "clientId": "GarminConnect",
+                "consumeServiceTicket": "false",
+            },
+            allow_redirects=False,
+            timeout=15,
+        )
+        location = resp.headers.get("Location", "")
+        m = re.search(r"[?&]ticket=([^&]+)", location)
+        if not m:
+            logger.debug(f"No ticket in SSO redirect (status={resp.status_code}, location={location[:200]})")
+            return False
+
+        ticket = m.group(1)
+        garth.client.sess.get(
+            f"{CONNECT_BASE}/modern/",
+            params={"ticket": ticket},
+            allow_redirects=True,
+            timeout=15,
+        )
+        save_connect_cookies()
+        logger.info("Established connect.garmin.com web session")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not set up web session: {e}")
+        return False
 
 
 def login_with_retry(email: str, password: str) -> None:
@@ -84,7 +153,7 @@ def login_with_retry(email: str, password: str) -> None:
         except Exception as e:
             last_exc = e
             if "429" in str(e) or "Too Many Requests" in str(e):
-                logger.warning(f"Rate limited (429). Waiting {delay}s before retry {attempt}/{len(delays)}...")
+                logger.warning(f"Rate limited. Waiting {delay}s before retry {attempt}/{len(delays)}...")
                 time.sleep(delay)
             else:
                 raise
@@ -92,68 +161,78 @@ def login_with_retry(email: str, password: str) -> None:
 
 
 def ensure_authenticated(email: str, password: str) -> None:
-    """Load saved tokens or perform a fresh login."""
     os.makedirs(TOKEN_STORE, exist_ok=True)
+
+    # Try to reuse saved tokens
     try:
         garth.load(TOKEN_STORE)
-        # Verify tokens are still valid
-        garth.connectapi("/userprofile-service/userprofile/personal-information")
-        logger.info("Reused saved session tokens — no login needed")
+        garth.client.connectapi("/userprofile-service/userprofile/personal-information")
+        logger.info("Reused saved OAuth tokens")
+        # Also restore web session cookies
+        if load_connect_cookies():
+            logger.info("Reused saved web session cookies")
+        else:
+            setup_connect_web_session()
         return
     except Exception:
         logger.info("No valid saved session, logging in...")
 
     login_with_retry(email, password)
     garth.save(TOKEN_STORE)
-    logger.info("Session tokens saved to disk")
+    logger.info("OAuth tokens saved")
+    setup_connect_web_session()
+
+
+# ---------------------------------------------------------------------------
+# Garmin Connect API helpers
+# ---------------------------------------------------------------------------
+
+def web_get(path: str, **kwargs) -> dict | list:
+    """GET via connect.garmin.com web session (cookie-based)."""
+    resp = garth.client.sess.get(f"{CONNECT_BASE}{path}", **kwargs)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def kudo_activity(activity_id: int) -> bool:
     try:
-        garmin_put(f"/activity-service/activity/{activity_id}/kudos")
+        garth.client.connectapi(f"/activity-service/activity/{activity_id}/kudos", method="PUT")
         return True
     except Exception as e:
-        logger.warning(f"Failed to like activity {activity_id}: {e}")
+        logger.warning(f"Failed to like {activity_id}: {e}")
         return False
 
 
 def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     try:
-        garmin_post(
+        garth.client.connectapi(
             f"/comment-service/comment/activity/{activity_id}",
+            method="POST",
             json={"comment": comment},
         )
         return comment
     except Exception as e:
-        logger.warning(f"Failed to comment on activity {activity_id}: {e}")
+        logger.warning(f"Failed to comment on {activity_id}: {e}")
         return None
 
 
-def garmin_get(path: str, **kwargs) -> dict | list:
-    return garth.client.connectapi(path, **kwargs)
-
-
-def garmin_put(path: str, **kwargs) -> None:
-    garth.client.connectapi(path, method="PUT", **kwargs)
-
-
-def garmin_post(path: str, **kwargs) -> None:
-    garth.client.connectapi(path, method="POST", **kwargs)
-
+# ---------------------------------------------------------------------------
+# Social feed & connections
+# ---------------------------------------------------------------------------
 
 def get_social_feed(max_activities: int = 100) -> list:
     paths = [
-        "/activitylist-service/activities/subscriptions",
-        "/activitylist-service/activities/following",
+        "/proxy/activitylist-service/activities/subscriptions",
+        "/proxy/activitylist-service/activities/following",
     ]
     page_size = 20
     for path in paths:
         collected = []
         try:
             for start in range(0, max_activities, page_size):
-                raw = garmin_get(path, params={"start": start, "limit": page_size})
-                logger.debug(f"Raw {path} start={start}: {str(raw)[:300]}")
+                raw = web_get(path, params={"start": start, "limit": page_size})
+                logger.debug(f"{path} start={start}: {str(raw)[:200]}")
 
                 if isinstance(raw, list):
                     page = raw
@@ -170,23 +249,51 @@ def get_social_feed(max_activities: int = 100) -> list:
                     break
 
             if collected:
-                logger.info(f"Feed endpoint {path} returned {len(collected)} activities")
+                logger.info(f"Social feed via {path}: {len(collected)} activities")
                 return collected
         except Exception as e:
-            logger.warning(f"Feed path {path} failed: {e}")
+            logger.debug(f"Feed path {path} failed: {e}")
 
-    logger.warning("All feed endpoints returned 0 activities.")
     return []
 
 
 def get_connections() -> list:
-    """Return list of colleague dicts from manual config."""
-    return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
+    if MANUAL_COLLEAGUES:
+        logger.info(f"Using manual colleague list: {MANUAL_COLLEAGUES}")
+        return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
+
+    # Try web session endpoints for connections
+    endpoints = [
+        "/proxy/userprofile-service/socialProfile/connections",
+        "/proxy/connection-service/connection/connected",
+    ]
+    for ep in endpoints:
+        try:
+            data = web_get(ep, params={"start": 0, "limit": 100})
+            logger.debug(f"Connections {ep}: {str(data)[:200]}")
+            if isinstance(data, list) and data:
+                logger.info(f"Found {len(data)} connections via {ep}")
+                return data
+            if isinstance(data, dict):
+                for key in ("connections", "userConnections", "connectionsList"):
+                    if data.get(key):
+                        result = data[key]
+                        logger.info(f"Found {len(result)} connections via {ep}")
+                        return result
+        except Exception as e:
+            logger.debug(f"Connections {ep} failed: {e}")
+
+    logger.warning(
+        "No connections found. If your colleagues are visible in the Garmin app, "
+        "set GARMIN_COLLEAGUES=displayname1,displayname2 in .env as a fallback."
+    )
+    return []
 
 
 def get_colleague_activities(display_name: str, limit: int = 10) -> list:
+    path = f"/proxy/activitylist-service/activities/{display_name}"
     try:
-        data = garmin_get(f"/activitylist-service/activities/{display_name}", params={"start": 0, "limit": limit})
+        data = web_get(path, params={"start": 0, "limit": limit})
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
@@ -195,6 +302,10 @@ def get_colleague_activities(display_name: str, limit: int = 10) -> list:
         logger.warning(f"Failed to fetch activities for {display_name}: {e}")
     return []
 
+
+# ---------------------------------------------------------------------------
+# Like logic
+# ---------------------------------------------------------------------------
 
 def like_activity(activity: dict, owner: str, liked: set) -> set:
     activity_id = activity.get("activityId")
@@ -205,10 +316,14 @@ def like_activity(activity: dict, owner: str, liked: set) -> set:
         return liked
 
     activity_name = activity.get("activityName", "—")
-    activity_type = activity.get("activityType", {}).get("typeKey", "unknown") if isinstance(activity.get("activityType"), dict) else activity.get("activityType", "unknown")
+    activity_type = (
+        activity.get("activityType", {}).get("typeKey", "unknown")
+        if isinstance(activity.get("activityType"), dict)
+        else activity.get("activityType", "unknown")
+    )
     activity_date = activity.get("startTimeLocal") or activity.get("beginTimestamp", "—")
 
-    logger.info(f"Processing: [{activity_type}] \"{activity_name}\" by {owner} on {activity_date}")
+    logger.info(f'Processing: [{activity_type}] "{activity_name}" by {owner} on {activity_date}')
     time.sleep(random.uniform(3, 10))
 
     if kudo_activity(activity_id):
@@ -230,7 +345,7 @@ def like_activity(activity: dict, owner: str, liked: set) -> set:
             "comment": comment,
         })
         logger.info(
-            f"✓ Liked [{activity_type}] \"{activity_name}\" by {owner}"
+            f'✓ Liked [{activity_type}] "{activity_name}" by {owner}'
             + (f" | comment: {comment}" if comment else "")
         )
     return liked
@@ -250,32 +365,34 @@ def process_feed(liked: set) -> set:
             new_likes += 1
 
     if new_likes == 0:
-        logger.info("No new activities to like in feed — falling back to last 10 activities per colleague")
-        connections = get_connections()
-        logger.info(f"Found {len(connections)} connections")
-        for conn in connections:
+        logger.info("No new feed activities — checking last 10 per colleague")
+        for conn in get_connections():
             display_name = conn.get("displayName") or conn.get("userProfileId")
             full_name = conn.get("fullName") or display_name
             if not display_name:
                 continue
-            colleague_activities = get_colleague_activities(str(display_name))
-            logger.info(f"  {full_name}: {len(colleague_activities)} activities fetched")
-            for activity in colleague_activities:
+            activities = get_colleague_activities(str(display_name))
+            logger.info(f"  {full_name}: {len(activities)} activities")
+            for activity in activities:
                 liked = like_activity(activity, full_name, liked)
 
     return liked
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
 
     if not email or not password:
-        logger.error("GARMIN_EMAIL and GARMIN_PASSWORD environment variables are required")
+        logger.error("GARMIN_EMAIL and GARMIN_PASSWORD are required")
         raise SystemExit(1)
 
     logger.info(f"Starting Garmin auto-like bot for {email}")
-    logger.info(f"Check interval: {CHECK_INTERVAL_SECONDS}s | Comments: {ADD_COMMENTS}")
+    logger.info(f"Interval: {CHECK_INTERVAL_SECONDS}s | Comments: {ADD_COMMENTS}")
 
     try:
         ensure_authenticated(email, password)
@@ -283,14 +400,6 @@ def main():
         logger.error(f"Login failed: {e}")
         raise SystemExit(1)
 
-    if MANUAL_COLLEAGUES:
-        logger.info(f"Colleagues configured: {MANUAL_COLLEAGUES}")
-    else:
-        logger.warning(
-            "GARMIN_COLLEAGUES is not set. Auto-discovery is not supported. "
-            "Add GARMIN_COLLEAGUES=displayname1,displayname2 to your .env file. "
-            "Find display names in Garmin Connect profile URLs."
-        )
     liked = load_liked_activities()
     logger.info(f"Loaded {len(liked)} previously liked activities")
 
@@ -298,14 +407,14 @@ def main():
         try:
             liked = process_feed(liked)
         except Exception as e:
-            logger.error(f"Error during feed processing: {e}")
+            logger.error(f"Feed processing error: {e}")
             try:
-                logger.info("Attempting token refresh / re-login...")
+                logger.info("Re-authenticating...")
                 ensure_authenticated(email, password)
-            except Exception as login_err:
-                logger.error(f"Re-login failed: {login_err}")
+            except Exception as ex:
+                logger.error(f"Re-auth failed: {ex}")
 
-        logger.info(f"Sleeping for {CHECK_INTERVAL_SECONDS} seconds until next check...")
+        logger.info(f"Sleeping {CHECK_INTERVAL_SECONDS}s...")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
