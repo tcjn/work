@@ -43,6 +43,8 @@ HISTORY_FILE = "/data/history.json"
 TOKEN_STORE = "/data/tokens"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS = os.getenv("ADD_COMMENTS", "true").lower() == "true"
+# Comma-separated Garmin Connect display names to like manually, e.g. "john.doe,jane.smith"
+MANUAL_COLLEAGUES = [c.strip() for c in os.getenv("GARMIN_COLLEAGUES", "").split(",") if c.strip()]
 
 
 def load_liked_activities() -> set:
@@ -129,15 +131,15 @@ def comment_activity(activity_id: int) -> str | None:
 
 
 def garmin_get(path: str, **kwargs) -> dict | list:
-    return garth.connectapi(path, **kwargs)
+    return garth.client.connectapi(path, **kwargs)
 
 
 def garmin_put(path: str, **kwargs) -> None:
-    garth.client.request("PUT", "connectapi", path, api=True, **kwargs)
+    garth.client.connectapi(path, method="PUT", **kwargs)
 
 
 def garmin_post(path: str, **kwargs) -> None:
-    garth.client.request("POST", "connectapi", path, api=True, **kwargs)
+    garth.client.connectapi(path, method="POST", **kwargs)
 
 
 def get_social_feed(max_activities: int = 100) -> list:
@@ -178,16 +180,23 @@ def get_social_feed(max_activities: int = 100) -> list:
 
 
 def get_connections() -> list:
-    """Return list of connections (people you follow)."""
+    """Return display names of connections, from API or manual config."""
+    if MANUAL_COLLEAGUES:
+        logger.info(f"Using manually configured colleagues: {MANUAL_COLLEAGUES}")
+        return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
+
+    username = garth.client.username
+    logger.info(f"Discovering connections for user: {username}")
+
     endpoints = [
+        f"/userprofile-service/socialProfile/{username}/connections",
         "/userprofile-service/socialProfile/connections",
-        "/userprofile-service/profile/social-profile/connections",
         "/connection-service/connection/connected",
     ]
     for ep in endpoints:
         try:
             data = garmin_get(ep, params={"start": 0, "limit": 100})
-            logger.info(f"Connections from {ep}: {str(data)[:300]}")
+            logger.info(f"Connections [{ep}]: {str(data)[:200]}")
             if isinstance(data, list) and data:
                 return data
             if isinstance(data, dict):
@@ -196,6 +205,11 @@ def get_connections() -> list:
                         return data[key]
         except Exception as e:
             logger.warning(f"Connections endpoint {ep} failed: {e}")
+
+    logger.warning(
+        "No connections found via API. "
+        "Set GARMIN_COLLEAGUES=displayname1,displayname2 in .env to specify colleagues manually."
+    )
     return []
 
 
@@ -298,32 +312,7 @@ def main():
         logger.error(f"Login failed: {e}")
         raise SystemExit(1)
 
-    # Diagnostics: confirm auth and discover display name + social endpoints
-    try:
-        profile = garth.connectapi("/userprofile-service/userprofile/personal-information")
-        display_name = profile.get("displayName") or profile.get("userName", "?")
-        logger.info(f"Logged in as: {display_name} (profile keys: {list(profile.keys())})")
-    except Exception as e:
-        logger.warning(f"Could not fetch profile: {e}")
-        display_name = None
-
-    try:
-        social = garth.connectapi(f"/userprofile-service/socialProfile")
-        logger.info(f"Social profile: {str(social)[:400]}")
-    except Exception as e:
-        logger.warning(f"Could not fetch social profile: {e}")
-
-    for ep in [
-        "/userprofile-service/socialProfile/followers",
-        "/userprofile-service/socialProfile/following",
-        "/activitylist-service/activities/subscriptions",
-    ]:
-        try:
-            data = garth.connectapi(ep, params={"start": 0, "limit": 5})
-            logger.info(f"DIAG {ep}: {str(data)[:300]}")
-        except Exception as e:
-            logger.warning(f"DIAG {ep} failed: {e}")
-
+    logger.info(f"Garmin username: {garth.client.username}")
     liked = load_liked_activities()
     logger.info(f"Loaded {len(liked)} previously liked activities")
 
