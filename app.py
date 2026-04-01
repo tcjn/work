@@ -162,8 +162,7 @@ def login_with_retry(client: Garmin, email: str) -> None:
 def get_client(email: str, password: str) -> Garmin:
     """Return an authenticated Garmin client, reusing saved tokens when possible."""
     os.makedirs(TOKEN_STORE, exist_ok=True)
-    client = Garmin(email, password, is_cn=False)
-    client.garth.configure(token_store=TOKEN_STORE)
+    client = Garmin(email, password)
 
     try:
         client.garth.load(TOKEN_STORE)
