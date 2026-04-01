@@ -95,7 +95,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garth.connectapi("/userprofile-service/userprofile/personal-information")
+        garth.client.get("connect", "/proxy/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -108,10 +108,7 @@ def ensure_authenticated(email: str, password: str) -> None:
 
 def kudo_activity(activity_id: int) -> bool:
     try:
-        garth.connectapi(
-            f"/activity-service/activity/{activity_id}/kudos",
-            method="PUT",
-        )
+        garth.client.put("connect", f"/proxy/activity-service/activity/{activity_id}/kudos")
         return True
     except Exception as e:
         logger.warning(f"Failed to like activity {activity_id}: {e}")
@@ -121,9 +118,9 @@ def kudo_activity(activity_id: int) -> bool:
 def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     try:
-        garth.connectapi(
-            f"/comment-service/comment/activity/{activity_id}",
-            method="POST",
+        garth.client.post(
+            "connect",
+            f"/proxy/comment-service/comment/activity/{activity_id}",
             json={"comment": comment},
         )
         return comment
@@ -132,21 +129,24 @@ def comment_activity(activity_id: int) -> str | None:
         return None
 
 
+def garmin_get(path: str, **kwargs) -> dict | list:
+    """Authenticated GET to connect.garmin.com/proxy/{path}."""
+    resp = garth.client.get("connect", f"/proxy{path}", **kwargs)
+    return resp.json()
+
+
 def get_social_feed(max_activities: int = 100) -> list:
-    # Social feed lives on connect.garmin.com/proxy/, not connectapi.garmin.com
-    base = "https://connect.garmin.com/proxy"
-    endpoints = [
-        f"{base}/activitylist-service/activities/subscriptions",
-        f"{base}/activitylist-service/activities/following",
+    paths = [
+        "/activitylist-service/activities/subscriptions",
+        "/activitylist-service/activities/following",
     ]
     page_size = 20
-    for endpoint in endpoints:
+    for path in paths:
         collected = []
         try:
             for start in range(0, max_activities, page_size):
-                resp = garth.client.get(endpoint, params={"start": start, "limit": page_size})
-                raw = resp.json()
-                logger.debug(f"Raw response from {endpoint} start={start}: {str(raw)[:500]}")
+                raw = garmin_get(path, params={"start": start, "limit": page_size})
+                logger.debug(f"Raw response from {path} start={start}: {str(raw)[:500]}")
 
                 if isinstance(raw, list):
                     page = raw
@@ -164,23 +164,19 @@ def get_social_feed(max_activities: int = 100) -> list:
                     break
 
             if collected:
-                logger.info(f"Feed endpoint: {endpoint}, total activities: {len(collected)}")
+                logger.info(f"Feed path: {path}, total activities: {len(collected)}")
                 return collected
         except Exception as e:
-            logger.warning(f"Endpoint {endpoint} failed: {e}")
+            logger.warning(f"Path {path} failed: {e}")
 
     logger.warning("All feed endpoints returned 0 activities. Check that you follow people on Garmin Connect.")
     return []
 
 
 def get_connections() -> list:
-    """Return list of display names of people you follow."""
+    """Return list of connections (people you follow)."""
     try:
-        resp = garth.client.get(
-            "https://connect.garmin.com/proxy/userprofile-service/socialProfile/connections",
-            params={"start": 0, "limit": 100},
-        )
-        data = resp.json()
+        data = garmin_get("/userprofile-service/socialProfile/connections", params={"start": 0, "limit": 100})
         logger.debug(f"Connections raw: {str(data)[:500]}")
         if isinstance(data, list):
             return data
@@ -193,11 +189,7 @@ def get_connections() -> list:
 
 def get_colleague_activities(display_name: str, limit: int = 10) -> list:
     try:
-        resp = garth.client.get(
-            f"https://connect.garmin.com/proxy/activitylist-service/activities/{display_name}",
-            params={"start": 0, "limit": limit},
-        )
-        data = resp.json()
+        data = garmin_get(f"/activitylist-service/activities/{display_name}", params={"start": 0, "limit": limit})
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
