@@ -95,7 +95,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garth.client.get("connect", "/proxy/userprofile-service/userprofile/personal-information")
+        garth.client.request("GET", "/proxy/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -108,7 +108,7 @@ def ensure_authenticated(email: str, password: str) -> None:
 
 def kudo_activity(activity_id: int) -> bool:
     try:
-        garth.client.put("connect", f"/proxy/activity-service/activity/{activity_id}/kudos")
+        garth.client.request("PUT", f"/proxy/activity-service/activity/{activity_id}/kudos")
         return True
     except Exception as e:
         logger.warning(f"Failed to like activity {activity_id}: {e}")
@@ -118,8 +118,8 @@ def kudo_activity(activity_id: int) -> bool:
 def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     try:
-        garth.client.post(
-            "connect",
+        garth.client.request(
+            "POST",
             f"/proxy/comment-service/comment/activity/{activity_id}",
             json={"comment": comment},
         )
@@ -129,10 +129,14 @@ def comment_activity(activity_id: int) -> str | None:
         return None
 
 
-def garmin_get(path: str, **kwargs) -> dict | list:
-    """Authenticated GET to connect.garmin.com/proxy/{path}."""
-    resp = garth.client.get("connect", f"/proxy{path}", **kwargs)
+def garmin_request(method: str, path: str, **kwargs) -> dict | list:
+    """Authenticated request to connect.garmin.com."""
+    resp = garth.client.request(method, f"/proxy{path}", **kwargs)
     return resp.json()
+
+
+def garmin_get(path: str, **kwargs) -> dict | list:
+    return garmin_request("GET", path, **kwargs)
 
 
 def get_social_feed(max_activities: int = 100) -> list:
