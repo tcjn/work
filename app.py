@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone
 
 import garth
-import requests as req_lib
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -96,7 +95,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garmin_get("/userprofile-service/userprofile/personal-information")
+        garth.client.get("connect", "/proxy/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -129,31 +128,16 @@ def comment_activity(activity_id: int) -> str | None:
         return None
 
 
-GARMIN_BASE = "https://connect.garmin.com/proxy"
-
-
-def _auth_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {garth.client.oauth2_token.access_token}",
-        "NK": "NT",
-        "Accept": "application/json",
-    }
-
-
 def garmin_get(path: str, **kwargs) -> dict | list:
-    resp = req_lib.get(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
-    resp.raise_for_status()
-    return resp.json()
+    return garth.client.get("connect", f"/proxy{path}", **kwargs).json()
 
 
 def garmin_put(path: str, **kwargs) -> None:
-    resp = req_lib.put(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
-    resp.raise_for_status()
+    garth.client.put("connect", f"/proxy{path}", **kwargs)
 
 
 def garmin_post(path: str, **kwargs) -> None:
-    resp = req_lib.post(f"{GARMIN_BASE}{path}", headers=_auth_headers(), **kwargs)
-    resp.raise_for_status()
+    garth.client.post("connect", f"/proxy{path}", **kwargs)
 
 
 def get_social_feed(max_activities: int = 100) -> list:
