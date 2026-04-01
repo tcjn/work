@@ -3,6 +3,7 @@ import time
 import random
 import logging
 import json
+from datetime import datetime, timezone
 
 import garth
 
@@ -38,6 +39,7 @@ POLISH_COMMENTS = [
 ]
 
 LIKED_ACTIVITIES_FILE = "/data/liked_activities.json"
+HISTORY_FILE = "/data/history.json"
 TOKEN_STORE = "/data/tokens"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS = os.getenv("ADD_COMMENTS", "true").lower() == "true"
@@ -55,6 +57,18 @@ def save_liked_activities(liked: set) -> None:
     os.makedirs(os.path.dirname(LIKED_ACTIVITIES_FILE), exist_ok=True)
     with open(LIKED_ACTIVITIES_FILE, "w") as f:
         json.dump(list(liked), f)
+
+
+def append_history(entry: dict) -> None:
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        history = []
+    history.append(entry)
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
 
 
 def login_with_retry(email: str, password: str) -> None:
@@ -98,14 +112,13 @@ def kudo_activity(activity_id: int) -> bool:
             f"/activity-service/activity/{activity_id}/kudos",
             method="PUT",
         )
-        logger.info(f"Liked activity {activity_id}")
         return True
     except Exception as e:
         logger.warning(f"Failed to like activity {activity_id}: {e}")
         return False
 
 
-def comment_activity(activity_id: int) -> bool:
+def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     try:
         garth.connectapi(
@@ -113,11 +126,10 @@ def comment_activity(activity_id: int) -> bool:
             method="POST",
             json={"comment": comment},
         )
-        logger.info(f"Commented on activity {activity_id}: {comment}")
-        return True
+        return comment
     except Exception as e:
         logger.warning(f"Failed to comment on activity {activity_id}: {e}")
-        return False
+        return None
 
 
 def get_social_feed(max_activities: int = 100) -> list:
@@ -166,29 +178,48 @@ def process_feed(liked: set) -> set:
     for activity in activities:
         activity_id = activity.get("activityId")
         owner = activity.get("ownerDisplayName", "unknown")
+        activity_name = activity.get("activityName", "—")
+        activity_type = activity.get("activityType", {}).get("typeKey", "unknown") if isinstance(activity.get("activityType"), dict) else activity.get("activityType", "unknown")
+        activity_date = activity.get("startTimeLocal") or activity.get("beginTimestamp", "—")
 
         if not activity_id:
             continue
 
         if activity_id in liked:
-            logger.debug(f"Activity {activity_id} by {owner} already liked, skipping")
+            logger.debug(f"Already liked: {activity_id} by {owner}")
             continue
 
         if activity.get("userKudoed", False):
-            logger.info(f"Activity {activity_id} by {owner} already kudoed, skipping")
             liked.add(activity_id)
             continue
 
-        logger.info(f"Processing activity {activity_id} by {owner}...")
+        logger.info(f"Processing: [{activity_type}] \"{activity_name}\" by {owner} on {activity_date}")
         time.sleep(random.uniform(3, 10))
 
         if kudo_activity(activity_id):
             liked.add(activity_id)
             save_liked_activities(liked)
 
+            comment = None
             if ADD_COMMENTS:
                 time.sleep(random.uniform(2, 5))
-                comment_activity(activity_id)
+                comment = comment_activity(activity_id)
+
+            now = datetime.now(timezone.utc).isoformat()
+            entry = {
+                "liked_at": now,
+                "activity_id": activity_id,
+                "owner": owner,
+                "activity_name": activity_name,
+                "activity_type": activity_type,
+                "activity_date": activity_date,
+                "comment": comment,
+            }
+            append_history(entry)
+            logger.info(
+                f"✓ Liked [{activity_type}] \"{activity_name}\" by {owner}"
+                + (f" | comment: {comment}" if comment else "")
+            )
 
     return liked
 
