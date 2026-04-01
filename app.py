@@ -133,16 +133,19 @@ def comment_activity(activity_id: int) -> str | None:
 
 
 def get_social_feed(max_activities: int = 100) -> list:
+    # Social feed lives on connect.garmin.com/proxy/, not connectapi.garmin.com
+    base = "https://connect.garmin.com/proxy"
     endpoints = [
-        "/activitylist-service/activities/subscriptions",
-        "/activitylist-service/activities/following",
+        f"{base}/activitylist-service/activities/subscriptions",
+        f"{base}/activitylist-service/activities/following",
     ]
     page_size = 20
     for endpoint in endpoints:
         collected = []
         try:
             for start in range(0, max_activities, page_size):
-                raw = garth.connectapi(endpoint, params={"start": start, "limit": page_size})
+                resp = garth.client.get(endpoint, params={"start": start, "limit": page_size})
+                raw = resp.json()
                 logger.debug(f"Raw response from {endpoint} start={start}: {str(raw)[:500]}")
 
                 if isinstance(raw, list):
@@ -158,7 +161,7 @@ def get_social_feed(max_activities: int = 100) -> list:
                 collected.extend(page)
 
                 if len(page) < page_size:
-                    break  # no more pages
+                    break
 
             if collected:
                 logger.info(f"Feed endpoint: {endpoint}, total activities: {len(collected)}")
