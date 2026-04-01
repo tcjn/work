@@ -1,0 +1,16 @@
+services:
+  garmin-autolike:
+    build: .
+    restart: unless-stopped
+    environment:
+      - GARMIN_EMAIL=${GARMIN_EMAIL}
+      - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      # How often to check for new activities (in seconds). Default: 3600 (1 hour)
+      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-3600}
+      # Set to "false" to only like without commenting
+      - ADD_COMMENTS=${ADD_COMMENTS:-true}
+    volumes:
+      - garmin_data:/data
+
+volumes:
+  garmin_data:
