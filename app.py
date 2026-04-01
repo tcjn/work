@@ -39,6 +39,7 @@ POLISH_COMMENTS = [
 ]
 
 LIKED_ACTIVITIES_FILE = "/data/liked_activities.json"
+TOKEN_STORE = "/data/tokens"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS = os.getenv("ADD_COMMENTS", "true").lower() == "true"
 
@@ -138,6 +139,47 @@ def process_feed(client: Garmin, liked: set) -> set:
     return liked
 
 
+def login_with_retry(client: Garmin, email: str) -> None:
+    """Login with exponential backoff. Raises on final failure."""
+    delays = [30, 60, 120, 300]
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            client.login()
+            logger.info("Successfully logged in to Garmin Connect")
+            return
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                if attempt <= len(delays):
+                    logger.warning(f"Rate limited (429). Waiting {delay}s before retry {attempt}/{len(delays)}...")
+                    time.sleep(delay)
+                else:
+                    raise
+            else:
+                raise
+    client.login()  # final attempt
+
+
+def get_client(email: str, password: str) -> Garmin:
+    """Return an authenticated Garmin client, reusing saved tokens when possible."""
+    os.makedirs(TOKEN_STORE, exist_ok=True)
+    client = Garmin(email, password, is_cn=False)
+    client.garth.configure(token_store=TOKEN_STORE)
+
+    try:
+        client.garth.load(TOKEN_STORE)
+        # Quick test to verify the token is still valid
+        client.get_full_name()
+        logger.info("Reused saved session tokens — no login needed")
+        return client
+    except Exception:
+        logger.info("No valid saved session, logging in...")
+
+    login_with_retry(client, email)
+    client.garth.dump(TOKEN_STORE)
+    logger.info("Session tokens saved to disk")
+    return client
+
+
 def main():
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
@@ -149,10 +191,8 @@ def main():
     logger.info(f"Starting Garmin auto-like bot for {email}")
     logger.info(f"Check interval: {CHECK_INTERVAL_SECONDS}s | Comments: {ADD_COMMENTS}")
 
-    client = Garmin(email, password)
     try:
-        client.login()
-        logger.info("Successfully logged in to Garmin Connect")
+        client = get_client(email, password)
     except Exception as e:
         logger.error(f"Login failed: {e}")
         raise SystemExit(1)
@@ -165,10 +205,10 @@ def main():
             liked = process_feed(client, liked)
         except Exception as e:
             logger.error(f"Error during feed processing: {e}")
-            # Re-login on unexpected errors
+            # Token may have expired — refresh
             try:
-                logger.info("Attempting to re-login...")
-                client.login()
+                logger.info("Attempting token refresh / re-login...")
+                client = get_client(email, password)
             except Exception as login_err:
                 logger.error(f"Re-login failed: {login_err}")
 
