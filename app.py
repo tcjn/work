@@ -6,8 +6,9 @@ import json
 
 import garth
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -120,19 +121,27 @@ def comment_activity(activity_id: int) -> bool:
 
 
 def get_social_feed(limit: int = 20) -> list:
-    try:
-        activities = garth.connectapi(
-            "/activitylist-service/activities/subscriptions",
-            params={"start": 0, "limit": limit},
-        )
-        if isinstance(activities, list):
-            return activities
-        if isinstance(activities, dict):
-            return activities.get("activityList", [])
-        return []
-    except Exception as e:
-        logger.error(f"Failed to fetch social feed: {e}")
-        return []
+    endpoints = [
+        "/activitylist-service/activities/subscriptions",
+        "/activitylist-service/activities/following",
+    ]
+    for endpoint in endpoints:
+        try:
+            raw = garth.connectapi(endpoint, params={"start": 0, "limit": limit})
+            logger.debug(f"Raw response from {endpoint}: {str(raw)[:500]}")
+            if isinstance(raw, list):
+                if raw:
+                    logger.info(f"Feed endpoint: {endpoint}")
+                    return raw
+            elif isinstance(raw, dict):
+                for key in ("activityList", "activities", "items"):
+                    if raw.get(key):
+                        logger.info(f"Feed endpoint: {endpoint}, key: {key}")
+                        return raw[key]
+        except Exception as e:
+            logger.warning(f"Endpoint {endpoint} failed: {e}")
+    logger.warning("All feed endpoints returned 0 activities. Check that you follow people on Garmin Connect.")
+    return []
 
 
 def process_feed(liked: set) -> set:
