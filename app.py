@@ -109,7 +109,6 @@ def load_connect_cookies() -> bool:
 def setup_connect_web_session() -> bool:
     """Exchange the existing SSO session for a connect.garmin.com session cookie."""
     try:
-        # Ask SSO for a service ticket for connect.garmin.com using existing cookies
         resp = garth.client.sess.get(
             "https://sso.garmin.com/sso/login",
             params={
@@ -122,9 +121,10 @@ def setup_connect_web_session() -> bool:
             timeout=15,
         )
         location = resp.headers.get("Location", "")
+        logger.debug(f"SSO ticket response: status={resp.status_code} location={location[:300]}")
         m = re.search(r"[?&]ticket=([^&]+)", location)
         if not m:
-            logger.debug(f"No ticket in SSO redirect (status={resp.status_code}, location={location[:200]})")
+            logger.warning(f"No SSO ticket in redirect (status={resp.status_code})")
             return False
 
         ticket = m.group(1)
@@ -134,6 +134,8 @@ def setup_connect_web_session() -> bool:
             allow_redirects=True,
             timeout=15,
         )
+        cookie_names = [c.name for c in garth.client.sess.cookies]
+        logger.info(f"Web session cookies: {cookie_names}")
         save_connect_cookies()
         logger.info("Established connect.garmin.com web session")
         return True
@@ -190,7 +192,10 @@ def ensure_authenticated(email: str, password: str) -> None:
 def web_get(path: str, **kwargs) -> dict | list:
     """GET via connect.garmin.com web session (cookie-based)."""
     resp = garth.client.sess.get(f"{CONNECT_BASE}{path}", **kwargs)
+    logger.debug(f"GET {path} → {resp.status_code} body={resp.text[:300]}")
     resp.raise_for_status()
+    if not resp.content:
+        return []
     return resp.json()
 
 
@@ -262,30 +267,31 @@ def get_connections() -> list:
         logger.info(f"Using manual colleague list: {MANUAL_COLLEAGUES}")
         return [{"displayName": n, "fullName": n} for n in MANUAL_COLLEAGUES]
 
-    # Try web session endpoints for connections
     endpoints = [
         "/proxy/userprofile-service/socialProfile/connections",
+        "/proxy/userprofile-service/socialProfile/followers",
+        "/proxy/userprofile-service/socialProfile/following",
         "/proxy/connection-service/connection/connected",
     ]
     for ep in endpoints:
         try:
             data = web_get(ep, params={"start": 0, "limit": 100})
-            logger.debug(f"Connections {ep}: {str(data)[:200]}")
+            logger.info(f"Connections [{ep}] raw: {str(data)[:300]}")
             if isinstance(data, list) and data:
                 logger.info(f"Found {len(data)} connections via {ep}")
                 return data
             if isinstance(data, dict):
-                for key in ("connections", "userConnections", "connectionsList"):
+                for key in ("connections", "userConnections", "connectionsList", "followers", "following"):
                     if data.get(key):
                         result = data[key]
-                        logger.info(f"Found {len(result)} connections via {ep}")
+                        logger.info(f"Found {len(result)} connections via {ep} key={key}")
                         return result
         except Exception as e:
-            logger.debug(f"Connections {ep} failed: {e}")
+            logger.warning(f"Connections {ep} → {e}")
 
     logger.warning(
-        "No connections found. If your colleagues are visible in the Garmin app, "
-        "set GARMIN_COLLEAGUES=displayname1,displayname2 in .env as a fallback."
+        "Could not auto-discover connections. "
+        "Add GARMIN_COLLEAGUES=displayname1,displayname2 in .env to override."
     )
     return []
 
@@ -353,7 +359,8 @@ def like_activity(activity: dict, owner: str, liked: set) -> set:
 
 def process_feed(liked: set) -> set:
     logger.info("Fetching social feed...")
-    activities = get_social_feed()
+    # Fetch a large window so we always have old activities available as fallback
+    activities = get_social_feed(max_activities=200)
     logger.info(f"Found {len(activities)} activities in feed")
 
     new_likes = 0
@@ -364,16 +371,20 @@ def process_feed(liked: set) -> set:
         if len(liked) > before:
             new_likes += 1
 
-    if new_likes == 0:
-        logger.info("No new feed activities — checking last 10 per colleague")
+    if new_likes == 0 and activities:
+        # Feed returned activities but all already liked — nothing new to do
+        logger.info("All feed activities already liked")
+    elif new_likes == 0:
+        # Feed was empty — fall back to per-colleague history
+        logger.info("Feed empty — fetching last 10 activities per colleague")
         for conn in get_connections():
             display_name = conn.get("displayName") or conn.get("userProfileId")
             full_name = conn.get("fullName") or display_name
             if not display_name:
                 continue
-            activities = get_colleague_activities(str(display_name))
-            logger.info(f"  {full_name}: {len(activities)} activities")
-            for activity in activities:
+            col_activities = get_colleague_activities(str(display_name), limit=10)
+            logger.info(f"  {full_name}: {len(col_activities)} activities fetched")
+            for activity in col_activities:
                 liked = like_activity(activity, full_name, liked)
 
     return liked
