@@ -298,6 +298,32 @@ def main():
         logger.error(f"Login failed: {e}")
         raise SystemExit(1)
 
+    # Diagnostics: confirm auth and discover display name + social endpoints
+    try:
+        profile = garth.connectapi("/userprofile-service/userprofile/personal-information")
+        display_name = profile.get("displayName") or profile.get("userName", "?")
+        logger.info(f"Logged in as: {display_name} (profile keys: {list(profile.keys())})")
+    except Exception as e:
+        logger.warning(f"Could not fetch profile: {e}")
+        display_name = None
+
+    try:
+        social = garth.connectapi(f"/userprofile-service/socialProfile")
+        logger.info(f"Social profile: {str(social)[:400]}")
+    except Exception as e:
+        logger.warning(f"Could not fetch social profile: {e}")
+
+    for ep in [
+        "/userprofile-service/socialProfile/followers",
+        "/userprofile-service/socialProfile/following",
+        "/activitylist-service/activities/subscriptions",
+    ]:
+        try:
+            data = garth.connectapi(ep, params={"start": 0, "limit": 5})
+            logger.info(f"DIAG {ep}: {str(data)[:300]}")
+        except Exception as e:
+            logger.warning(f"DIAG {ep} failed: {e}")
+
     liked = load_liked_activities()
     logger.info(f"Loaded {len(liked)} previously liked activities")
 
