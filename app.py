@@ -95,7 +95,7 @@ def ensure_authenticated(email: str, password: str) -> None:
     try:
         garth.load(TOKEN_STORE)
         # Verify tokens are still valid
-        garth.client.get("connect", "/proxy/userprofile-service/userprofile/personal-information")
+        garth.client.get("connect", "/modern/proxy/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens — no login needed")
         return
     except Exception:
@@ -128,30 +128,33 @@ def comment_activity(activity_id: int) -> str | None:
         return None
 
 
-def garmin_get(path: str, **kwargs) -> dict | list:
-    return garth.client.get("connect", f"/proxy{path}", **kwargs).json()
+def garmin_get(path: str, base: str = "/modern/proxy", **kwargs) -> dict | list:
+    return garth.client.get("connect", f"{base}{path}", **kwargs).json()
 
 
 def garmin_put(path: str, **kwargs) -> None:
-    garth.client.put("connect", f"/proxy{path}", **kwargs)
+    garth.client.put("connect", f"/modern/proxy{path}", **kwargs)
 
 
 def garmin_post(path: str, **kwargs) -> None:
-    garth.client.post("connect", f"/proxy{path}", **kwargs)
+    garth.client.post("connect", f"/modern/proxy{path}", **kwargs)
 
 
 def get_social_feed(max_activities: int = 100) -> list:
-    paths = [
-        "/activitylist-service/activities/subscriptions",
-        "/activitylist-service/activities/following",
+    # Try both /modern/proxy and /proxy prefix, and multiple endpoint paths
+    attempts = [
+        ("/modern/proxy", "/activitylist-service/activities/subscriptions"),
+        ("/modern/proxy", "/activitylist-service/activities/following"),
+        ("/proxy",        "/activitylist-service/activities/subscriptions"),
+        ("/proxy",        "/activitylist-service/activities/following"),
     ]
     page_size = 20
-    for path in paths:
+    for base, path in attempts:
         collected = []
         try:
             for start in range(0, max_activities, page_size):
-                raw = garmin_get(path, params={"start": start, "limit": page_size})
-                logger.debug(f"Raw response from {path} start={start}: {str(raw)[:500]}")
+                raw = garmin_get(path, base=base, params={"start": start, "limit": page_size})
+                logger.info(f"[DEBUG] {base}{path} start={start}: {str(raw)[:300]}")
 
                 if isinstance(raw, list):
                     page = raw
@@ -160,21 +163,22 @@ def get_social_feed(max_activities: int = 100) -> list:
                         (raw[k] for k in ("activityList", "activities", "items") if raw.get(k)),
                         [],
                     )
+                    if not page:
+                        logger.info(f"[DEBUG] dict keys returned: {list(raw.keys())}")
                 else:
                     page = []
 
                 collected.extend(page)
-
                 if len(page) < page_size:
                     break
 
             if collected:
-                logger.info(f"Feed path: {path}, total activities: {len(collected)}")
+                logger.info(f"Feed working at {base}{path}, total: {len(collected)}")
                 return collected
         except Exception as e:
-            logger.warning(f"Path {path} failed: {e}")
+            logger.warning(f"Path {base}{path} failed: {e}")
 
-    logger.warning("All feed endpoints returned 0 activities. Check that you follow people on Garmin Connect.")
+    logger.warning("All feed endpoints returned 0 activities.")
     return []
 
 
