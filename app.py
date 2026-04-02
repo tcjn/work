@@ -167,7 +167,6 @@ def ensure_login(config: Config) -> None:
         logging.info("Token resume failed; logging in with credentials")
         login_with_retry(config)
 
-
 def _looks_like_activity(item: object) -> bool:
     if not isinstance(item, dict):
         return False
@@ -324,7 +323,7 @@ def main() -> None:
     history_path = config.data_dir / "history.json"
     seen_path = config.data_dir / "seen_activities.json"
 
-    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s | feed_endpoints=%s", config.mode, config.feed_limit, config.feed_endpoints)
+    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s", config.mode, config.feed_limit)
 
     while True:
         try:
