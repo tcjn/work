@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 import garth
 from garth.exc import GarthHTTPError
 
+
+class SessionExpiredError(RuntimeError):
+    """Raised when Garmin returns an HTML sign-in/SSO page instead of API JSON."""
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -235,10 +239,14 @@ def _web_get(path: str, **kwargs):
         return None
     ct = r.headers.get("content-type", "")
     if "json" not in ct:
+        snippet = (r.text or "")[:300]
         logger.warning(
             f"Non-JSON from {path}: status={r.status_code} "
-            f"ct={ct} body={r.text[:300]}"
+            f"ct={ct} body={snippet}"
         )
+        lowered = snippet.lower()
+        if "garmin connect | sign in" in lowered or "garmin sso portal" in lowered:
+            raise SessionExpiredError("Garmin web session appears expired")
         return None
     return r.json()
 
@@ -288,6 +296,8 @@ def _parse_activities(raw) -> list:
 
 def get_feed(limit: int = 10) -> list:
     page_size = min(limit, 20)
+    auth_failures = 0
+
     for ep in _FEED_ENDPOINTS:
         collected: list = []
         try:
@@ -304,8 +314,14 @@ def get_feed(limit: int = 10) -> list:
                 logger.info(f"Feed via {ep}: {len(collected)} activities")
                 return collected
             logger.debug(f"Feed {ep}: 0 activities, trying next")
+        except SessionExpiredError:
+            auth_failures += 1
+            logger.warning(f"Feed {ep} indicates expired web session")
         except Exception as e:
             logger.warning(f"Feed {ep} failed: {e}")
+
+    if auth_failures == len(_FEED_ENDPOINTS):
+        raise SessionExpiredError("All feed endpoints redirected to sign-in")
 
     logger.warning("All feed endpoints returned 0 activities")
     return []
