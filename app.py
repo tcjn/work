@@ -94,6 +94,18 @@ def _is_connect_modern_url(url: str) -> bool:
     return host == "connect.garmin.com"
 
 
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
+
+
 # ---------- persistence ----------
 
 def load_liked_activities() -> set:
