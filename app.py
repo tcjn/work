@@ -275,8 +275,14 @@ def _web_post(path: str, **kwargs) -> bool:
 
 # ---------- newsfeed ----------
 
-_FEED_ENDPOINTS = [
-    # modern proxy — works once we have SSO cookies
+_API_FEED_ENDPOINTS = [
+    # OAuth feed endpoints on connectapi.garmin.com
+    "/activitylist-service/activities/subscriptionFeed",
+    "/activitylist-service/activities/subscriptions",
+]
+
+_WEB_FEED_ENDPOINTS = [
+    # Browser feed endpoints on connect.garmin.com
     "/modern/proxy/activitylist-service/activities/subscriptionFeed",
     "/modern/proxy/activitylist-service/activities/subscriptions",
 ]
@@ -302,23 +308,47 @@ def get_feed(limit: int = 10) -> list:
         collected: list = []
         try:
             for start in range(0, limit, page_size):
-                raw = _web_get(ep, params={"start": start, "limit": page_size})
+                raw = _garth_api_get(ep, params={"start": start, "limit": page_size})
                 if raw is None:
                     break
                 page = _parse_activities(raw)
-                logger.debug(f"{ep} start={start} → {len(page)} items")
+                logger.debug(f"API {ep} start={start} → {len(page)} items")
                 collected.extend(page)
                 if len(page) < page_size:
                     break
             if collected:
-                logger.info(f"Feed via {ep}: {len(collected)} activities")
+                logger.info(f"Feed via API {ep}: {len(collected)} activities")
+                return collected
+            logger.debug(f"Feed API {ep}: 0 activities, trying next")
+        except Exception as e:
+            logger.warning(f"Feed API {ep} failed: {e}")
+
+    # 2) Fallback to web feed endpoints when API returns nothing/fails
+    auth_failures = 0
+    for ep in _WEB_FEED_ENDPOINTS:
+        collected = []
+        try:
+            for start in range(0, limit, page_size):
+                raw = _web_get(ep, params={"start": start, "limit": page_size})
+                if raw is None:
+                    break
+                page = _parse_activities(raw)
+                logger.debug(f"WEB {ep} start={start} → {len(page)} items")
+                collected.extend(page)
+                if len(page) < page_size:
+                    break
+            if collected:
+                logger.info(f"Feed via web {ep}: {len(collected)} activities")
                 return collected
             logger.debug(f"Feed {ep}: 0 activities, trying next")
         except SessionExpiredError:
             auth_failures += 1
             logger.warning(f"Feed {ep} indicates expired web session")
         except Exception as e:
-            logger.warning(f"Feed {ep} failed: {e}")
+            logger.warning(f"Feed web {ep} failed: {e}")
+
+    if auth_failures == len(_WEB_FEED_ENDPOINTS):
+        raise SessionExpiredError("All web feed endpoints redirected to sign-in")
 
     if auth_failures == len(_FEED_ENDPOINTS):
         raise SessionExpiredError("All feed endpoints redirected to sign-in")
@@ -451,17 +481,21 @@ def main():
     logger.info(f"Loaded {len(liked)} previously liked activities")
 
     while True:
+        should_sleep = True
         try:
             liked = process_feed(liked)
         except Exception as e:
             logger.error(f"Feed processing error: {e}")
             try:
                 ensure_authenticated(email, password)
+                should_sleep = False
+                logger.info("Re-authenticated successfully; retrying feed immediately")
             except Exception as ex:
                 logger.error(f"Re-auth failed: {ex}")
 
-        logger.info(f"Sleeping {CHECK_INTERVAL_SECONDS}s...")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        if should_sleep:
+            logger.info(f"Sleeping {CHECK_INTERVAL_SECONDS}s...")
+            time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
