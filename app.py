@@ -167,106 +167,42 @@ def ensure_login(config: Config) -> None:
         logging.info("Token resume failed; logging in with credentials")
         login_with_retry(config)
 
-
 def _looks_like_activity(item: object) -> bool:
     if not isinstance(item, dict):
         return False
-
-    if _extract_activity_id_from_dict(item) is not None:
-        return True
-
-    activity_markers = {
-        "activityName",
-        "activityType",
-        "eventType",
-        "ownerDisplayName",
-        "startTimeGMT",
-        "startTimeLocal",
-        "distance",
-        "duration",
-    }
-    marker_hits = sum(1 for key in activity_markers if key in item)
-    return marker_hits >= 3
-
-
-
-def _extract_activity_id_from_dict(item: dict) -> int | None:
-    for key in ("activityId", "id", "itemId"):
-        value = item.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-
-    entity_id = item.get("entityId")
-    if isinstance(entity_id, str) and entity_id.startswith("activity:"):
-        possible = entity_id.split(":", 1)[1]
-        if possible.isdigit():
-            return int(possible)
-
-    return None
-
-
-
-def _normalize_activity_shape(item: dict) -> dict:
-    activity_id = _extract_activity_id_from_dict(item)
-    if activity_id is None:
-        return item
-
-    normalized = dict(item)
-    normalized["activityId"] = activity_id
-    return normalized
-
+    activity_id = item.get("activityId")
+    return isinstance(activity_id, int) or str(activity_id).isdigit()
 
 
 def _extract_activities(payload: object) -> list[dict]:
-    found: list[dict] = []
-    seen_ids: set[int] = set()
-
-    def visit(node: object) -> None:
-        if isinstance(node, dict):
-            if _looks_like_activity(node):
-                normalized = _normalize_activity_shape(node)
-                activity_id = _extract_activity_id_from_dict(normalized)
-                if activity_id is not None and activity_id not in seen_ids:
-                    seen_ids.add(activity_id)
-                    found.append(normalized)
-
-            for value in node.values():
-                visit(value)
-            return
-
-        if isinstance(node, list):
-            for value in node:
-                visit(value)
-
-    visit(payload)
-    return found
-
-
-
-def _describe_payload(payload: object) -> str:
     if isinstance(payload, list):
-        if not payload:
-            return "list(len=0)"
-        first = payload[0]
-        if isinstance(first, dict):
-            first_keys = sorted(first.keys())[:15]
-            nested_keys = sorted(
-                {
-                    nested_key
-                    for value in first.values()
-                    if isinstance(value, dict)
-                    for nested_key in value.keys()
-                }
-            )[:15]
-            return f"list(len={len(payload)} first_keys={first_keys} first_nested_keys={nested_keys})"
-        return f"list(len={len(payload)} first_type={type(first).__name__})"
+        return [item for item in payload if isinstance(item, dict) and _looks_like_activity(item)]
 
     if isinstance(payload, dict):
-        return f"dict(keys={sorted(payload.keys())[:20]})"
+        for key in ("activityList", "activities", "items", "results", "feedItems"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                direct = [item for item in value if isinstance(item, dict) and _looks_like_activity(item)]
+                if direct:
+                    return direct
+                nested: list[dict] = []
+                for entry in value:
+                    if isinstance(entry, dict):
+                        for nested_key in ("activity", "activityDTO", "activitySummary", "entity"):
+                            nested_item = entry.get(nested_key)
+                            if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
+                                nested.append(nested_item)
+                if nested:
+                    return nested
 
-    return f"{type(payload).__name__}"
+        # Recursive fallback to handle unknown wrapper shapes.
+        recursive: list[dict] = []
+        for value in payload.values():
+            recursive.extend(_extract_activities(value))
+            if recursive:
+                return recursive
+
+    return []
 
 
 def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
@@ -277,11 +213,18 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
             logging.info("Using feed endpoint '%s' (activities=%s)", endpoint, len(activities))
             return activities
 
-        logging.warning(
-            "Feed endpoint '%s' returned 0 activities; payload=%s",
-            endpoint,
-            _describe_payload(payload),
-        )
+        if isinstance(payload, dict):
+            logging.warning(
+                "Feed endpoint '%s' returned 0 activities; payload keys=%s",
+                endpoint,
+                sorted(payload.keys())[:12],
+            )
+        else:
+            logging.warning(
+                "Feed endpoint '%s' returned 0 activities; payload type=%s",
+                endpoint,
+                type(payload).__name__,
+            )
 
     return []
 
@@ -289,7 +232,12 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
 
 
 def _activity_id(activity: dict) -> int | None:
-    return _extract_activity_id_from_dict(activity)
+    value = activity.get("activityId")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 def iter_targets(activities: Iterable[dict], mode: str, already_liked: set[int]) -> list[dict]:
     if mode == "last10":
@@ -375,7 +323,7 @@ def main() -> None:
     history_path = config.data_dir / "history.json"
     seen_path = config.data_dir / "seen_activities.json"
 
-    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s | feed_endpoints=%s", config.mode, config.feed_limit, config.feed_endpoints)
+    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s", config.mode, config.feed_limit)
 
     while True:
         try:
