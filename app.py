@@ -302,9 +302,9 @@ def _parse_activities(raw) -> list:
 
 def get_feed(limit: int = 10) -> list:
     page_size = min(limit, 20)
+    auth_failures = 0
 
-    # 1) Prefer OAuth feed API (does not depend on browser SSO cookies)
-    for ep in _API_FEED_ENDPOINTS:
+    for ep in _FEED_ENDPOINTS:
         collected: list = []
         try:
             for start in range(0, limit, page_size):
@@ -340,7 +340,7 @@ def get_feed(limit: int = 10) -> list:
             if collected:
                 logger.info(f"Feed via web {ep}: {len(collected)} activities")
                 return collected
-            logger.debug(f"Feed web {ep}: 0 activities, trying next")
+            logger.debug(f"Feed {ep}: 0 activities, trying next")
         except SessionExpiredError:
             auth_failures += 1
             logger.warning(f"Feed {ep} indicates expired web session")
@@ -349,6 +349,9 @@ def get_feed(limit: int = 10) -> list:
 
     if auth_failures == len(_WEB_FEED_ENDPOINTS):
         raise SessionExpiredError("All web feed endpoints redirected to sign-in")
+
+    if auth_failures == len(_FEED_ENDPOINTS):
+        raise SessionExpiredError("All feed endpoints redirected to sign-in")
 
     logger.warning("All feed endpoints returned 0 activities")
     return []
