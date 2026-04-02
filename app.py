@@ -1,9 +1,10 @@
 import os
+import re
 import time
 import random
 import logging
 import json
-import requests
+import requests as _requests
 from datetime import datetime, timezone
 
 import garth
@@ -45,6 +46,9 @@ HISTORY_FILE           = "/data/history.json"
 TOKEN_STORE            = "/data/tokens"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS           = os.getenv("ADD_COMMENTS", "true").lower() == "true"
+
+CONNECT_BASE = "https://connect.garmin.com"
+SSO_BASE     = "https://sso.garmin.com/sso"
 
 
 # ---------- persistence ----------
@@ -95,120 +99,178 @@ def login_with_retry(email: str, password: str) -> None:
     raise last_exc
 
 
-def _exchange_for_web_session() -> None:
-    """Exchange OAuth2 token for connect.garmin.com web session cookies.
+def _sso_web_cookie_exchange() -> bool:
+    """
+    Exchange garth's sso.garmin.com session cookies for connect.garmin.com
+    web session cookies — no second credential login required.
 
-    Garth's SSO flow never visits connect.garmin.com, so modern/proxy endpoints
-    have no session cookies.  The di-oauth/exchange endpoint converts a Bearer
-    token into those cookies so subsequent requests to /modern/proxy/ work.
+    After garth.login(), garth.client.sess holds SSO cookies for sso.garmin.com.
+    Standard CAS SSO: hitting sso/signin with service=connect.garmin.com/modern
+    and valid SSO session cookies returns a redirect straight to connect.garmin.com
+    (no credentials needed), which sets the web session cookies in garth.client.sess.
     """
     try:
-        resp = garth.client.request(
-            "GET", "connect", "/modern/di-oauth/exchange",
-            api=True,
-            headers={"NK": "NT"},
+        sess = garth.client.sess
+        r = sess.get(
+            f"{SSO_BASE}/signin",
+            params={"service": f"{CONNECT_BASE}/modern"},
+            allow_redirects=True,
+            timeout=15,
         )
-        logger.debug(
-            f"di-oauth exchange: status={resp.status_code} "
-            f"cookies={list(garth.client.sess.cookies.keys())}"
+        logger.info(
+            f"SSO web exchange: final_url={r.url} "
+            f"status={r.status_code} "
+            f"cookies={list(sess.cookies.keys())}"
         )
+        # Success: we should have landed on connect.garmin.com
+        return "connect.garmin.com" in r.url
     except Exception as e:
-        logger.debug(f"di-oauth exchange skipped: {e}")
+        logger.warning(f"SSO web exchange failed: {e}")
+        return False
+
+
+def _sso_web_login_full(email: str, password: str) -> bool:
+    """
+    Full SSO web login for connect.garmin.com — used as fallback if the
+    cookie exchange doesn't work.  Stores cookies in garth.client.sess so
+    all subsequent web requests automatically carry them.
+    """
+    try:
+        sess = garth.client.sess
+        MODERN = f"{CONNECT_BASE}/modern"
+        params = {
+            "service": MODERN,
+            "gauthHost": SSO_BASE,
+            "locale": "en_US",
+            "id": "gauth-widget",
+            "clientId": "GarminConnect",
+            "consumeServiceTicket": "false",
+            "embedWidget": "false",
+            "generateExtraServiceTicket": "true",
+        }
+
+        # 1. Get CSRF token
+        r = sess.get(f"{SSO_BASE}/signin", params=params, timeout=15)
+        csrf_m = re.search(r'name="_csrf"\s+value="(.+?)"', r.text)
+        if not csrf_m:
+            logger.warning("Full SSO: CSRF token not found in login page")
+            return False
+
+        # 2. Submit credentials
+        r = sess.post(
+            f"{SSO_BASE}/signin",
+            params=params,
+            data={
+                "username": email,
+                "password": password,
+                "embed": "false",
+                "_csrf": csrf_m.group(1),
+            },
+            allow_redirects=True,
+            timeout=15,
+        )
+
+        logger.info(
+            f"Full SSO web login: final_url={r.url} "
+            f"cookies={list(sess.cookies.keys())}"
+        )
+        return "connect.garmin.com" in r.url
+    except Exception as e:
+        logger.warning(f"Full SSO web login failed: {e}")
+        return False
 
 
 def ensure_authenticated(email: str, password: str) -> None:
     os.makedirs(TOKEN_STORE, exist_ok=True)
+
+    # Step 1: OAuth via garth (needed for connectapi.garmin.com endpoints)
     try:
         garth.load(TOKEN_STORE)
         garth.client.connectapi("/userprofile-service/userprofile/personal-information")
-        logger.info("Reused saved session tokens")
-        _exchange_for_web_session()
-        return
+        logger.info("Reused saved OAuth session tokens")
     except Exception:
-        logger.info("No valid saved session, logging in...")
-    login_with_retry(email, password)
-    garth.save(TOKEN_STORE)
-    logger.info("Tokens saved to disk")
-    _exchange_for_web_session()
+        logger.info("No valid saved session, logging in via OAuth...")
+        login_with_retry(email, password)
+        garth.save(TOKEN_STORE)
+        logger.info("OAuth tokens saved")
+
+    # Step 2: Web session cookies for connect.garmin.com/modern/proxy endpoints
+    # Try fast exchange first (reuses existing sso.garmin.com cookies from garth),
+    # fall back to full web SSO login if needed.
+    logger.info("Establishing connect.garmin.com web session...")
+    if not _sso_web_cookie_exchange():
+        logger.info("Cookie exchange failed, trying full SSO web login...")
+        if not _sso_web_login_full(email, password):
+            logger.warning("Could not establish web session — feed may fail")
+
+    # Update garth session headers for web requests
+    garth.client.sess.headers.update({
+        "NK": "NT",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{CONNECT_BASE}/app/newsfeed",
+    })
 
 
-# ---------- HTTP helpers (garth.client.request → correct subdomain + Bearer) ----------
-# garth.client.request(method, subdomain, path, api=True) builds:
-#   https://{subdomain}.garmin.com{path}  + Authorization: Bearer <oauth2>
+# ---------- HTTP helpers ----------
+# All requests use garth.client.sess which now has both:
+#   • SSO cookies  → accepted by connect.garmin.com/modern/proxy/*
+#   • OAuth Bearer → added via api=True for connectapi.garmin.com
 
-_WEB_HEADERS = {
-    "NK": "NT",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://connect.garmin.com/app/newsfeed",
-    "X-app-ver": "4.70.1.0",
-    "di-backend": "connectapi.garmin.com",
-}
+def _garth_api_get(path: str, **kwargs):
+    """GET connectapi.garmin.com with OAuth Bearer (garth managed)."""
+    try:
+        resp = garth.client.connectapi(path, params=kwargs.get("params"))
+        return resp
+    except GarthHTTPError as e:
+        raise
 
 
-def _garth_get(subdomain: str, path: str, **kwargs):
-    resp = garth.client.request(
-        "GET", subdomain, path,
-        api=True,
-        headers=_WEB_HEADERS,
-        **kwargs,
-    )
-    if resp.status_code == 204:
+def _web_get(path: str, **kwargs):
+    """GET connect.garmin.com using SSO session cookies."""
+    sess = garth.client.sess
+    r = sess.get(f"{CONNECT_BASE}{path}", **kwargs)
+    logger.debug(f"WEB GET {path} → {r.status_code}")
+    r.raise_for_status()
+    if r.status_code == 204 or not r.content:
         return None
-    ct = resp.headers.get("content-type", "")
+    ct = r.headers.get("content-type", "")
     if "json" not in ct:
         logger.warning(
-            f"Non-JSON from {subdomain} {path}: "
-            f"status={resp.status_code} ct={ct} body={resp.text[:300]}"
+            f"Non-JSON from {path}: status={r.status_code} "
+            f"ct={ct} body={r.text[:300]}"
         )
         return None
-    return resp.json()
+    return r.json()
 
 
-def _garth_put(subdomain: str, path: str, **kwargs) -> bool:
+def _web_put(path: str, **kwargs) -> bool:
+    sess = garth.client.sess
     try:
-        garth.client.request(
-            "PUT", subdomain, path,
-            api=True,
-            headers=_WEB_HEADERS,
-            **kwargs,
-        )
+        r = sess.put(f"{CONNECT_BASE}{path}", **kwargs)
+        r.raise_for_status()
         return True
-    except GarthHTTPError as e:
-        logger.debug(f"PUT {subdomain}/{path} → {e}")
+    except Exception as e:
+        logger.debug(f"WEB PUT {path} failed: {e}")
         return False
 
 
-def _garth_post(subdomain: str, path: str, **kwargs) -> bool:
+def _web_post(path: str, **kwargs) -> bool:
+    sess = garth.client.sess
     try:
-        garth.client.request(
-            "POST", subdomain, path,
-            api=True,
-            headers=_WEB_HEADERS,
-            **kwargs,
-        )
+        r = sess.post(f"{CONNECT_BASE}{path}", **kwargs)
+        r.raise_for_status()
         return True
-    except GarthHTTPError as e:
-        logger.debug(f"POST {subdomain}/{path} → {e}")
+    except Exception as e:
+        logger.debug(f"WEB POST {path} failed: {e}")
         return False
 
 
 # ---------- newsfeed ----------
 
-# Each entry: (subdomain, path_template)
-# connect.garmin.com/modern/proxy/* routes to internal services via di-backend header
-# connectapi.garmin.com/* uses OAuth Bearer directly
-_FEED_CANDIDATES = [
-    # modern proxy — relies on di-oauth exchange cookies + Bearer
-    ("connect", "/modern/proxy/activitylist-service/activities/subscriptionFeed"),
-    ("connect", "/modern/proxy/activitylist-service/activities/subscriptions"),
-    # direct on connect (no proxy prefix)
-    ("connect", "/activitylist-service/activities/subscriptionFeed"),
-    # connectapi variants — some may still be alive
-    ("connectapi", "/activitylist-service/activities/subscriptions"),
-    ("connectapi", "/activitylist-service/activities/subscriptionFeed"),
-    # social-service paths seen in reverse-engineering
-    ("connectapi", "/social-service/social/connections/activities"),
-    ("connectapi", "/community-user-api/community/activities/following"),
+_FEED_ENDPOINTS = [
+    # modern proxy — works once we have SSO cookies
+    "/modern/proxy/activitylist-service/activities/subscriptionFeed",
+    "/modern/proxy/activitylist-service/activities/subscriptions",
 ]
 
 
@@ -225,30 +287,25 @@ def _parse_activities(raw) -> list:
 
 
 def get_feed(limit: int = 10) -> list:
-    """Fetch up to `limit` recent activities from the social newsfeed."""
     page_size = min(limit, 20)
-
-    for subdomain, ep in _FEED_CANDIDATES:
+    for ep in _FEED_ENDPOINTS:
         collected: list = []
         try:
             for start in range(0, limit, page_size):
-                raw = _garth_get(subdomain, ep, params={"start": start, "limit": page_size})
+                raw = _web_get(ep, params={"start": start, "limit": page_size})
                 if raw is None:
                     break
                 page = _parse_activities(raw)
-                logger.debug(f"{subdomain}{ep} start={start} → {len(page)} items")
+                logger.debug(f"{ep} start={start} → {len(page)} items")
                 collected.extend(page)
                 if len(page) < page_size:
                     break
             if collected:
-                logger.info(f"Feed via {subdomain}{ep}: {len(collected)} activities")
+                logger.info(f"Feed via {ep}: {len(collected)} activities")
                 return collected
-            else:
-                logger.debug(f"Feed {subdomain}{ep}: 0 activities, trying next")
-        except GarthHTTPError as e:
-            logger.warning(f"Feed {subdomain}{ep} failed: {e}")
+            logger.debug(f"Feed {ep}: 0 activities, trying next")
         except Exception as e:
-            logger.warning(f"Feed {subdomain}{ep} error: {e}")
+            logger.warning(f"Feed {ep} failed: {e}")
 
     logger.warning("All feed endpoints returned 0 activities")
     return []
@@ -256,35 +313,40 @@ def get_feed(limit: int = 10) -> list:
 
 # ---------- kudos / comment ----------
 
-_KUDO_CANDIDATES = [
-    ("connectapi", "/activity-service/activity/{id}/kudos"),
-    ("connect",    "/modern/proxy/social-service/kudos/{id}"),
-    ("connect",    "/modern/proxy/activity-service/activity/{id}/kudos"),
-]
-
-_COMMENT_CANDIDATES = [
-    ("connectapi", "/comment-service/comment/activity/{id}"),
-    ("connect",    "/modern/proxy/comment-service/comment/activity/{id}"),
-]
-
-
 def kudo_activity(activity_id: int) -> bool:
-    for subdomain, tpl in _KUDO_CANDIDATES:
-        path = tpl.format(id=activity_id)
-        if _garth_put(subdomain, path):
-            logger.debug(f"Kudos sent via {subdomain}{path}")
-            return True
-    logger.warning(f"All kudo endpoints failed for {activity_id}")
-    return False
+    # Try OAuth (connectapi) first — more reliable than web session for writes
+    try:
+        garth.client.connectapi(
+            f"/activity-service/activity/{activity_id}/kudos",
+            method="PUT",
+        )
+        return True
+    except GarthHTTPError as e:
+        logger.debug(f"connectapi kudo failed: {e}")
+
+    # Fall back to web session
+    return _web_put(f"/modern/proxy/social-service/kudos/{activity_id}")
 
 
 def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
-    for subdomain, tpl in _COMMENT_CANDIDATES:
-        path = tpl.format(id=activity_id)
-        if _garth_post(subdomain, path, json={"comment": comment}):
-            return comment
-    logger.warning(f"All comment endpoints failed for {activity_id}")
+    # Try OAuth first
+    try:
+        garth.client.connectapi(
+            f"/comment-service/comment/activity/{activity_id}",
+            method="POST",
+            json={"comment": comment},
+        )
+        return comment
+    except GarthHTTPError as e:
+        logger.debug(f"connectapi comment failed: {e}")
+
+    # Fall back to web session
+    if _web_post(
+        f"/modern/proxy/comment-service/comment/activity/{activity_id}",
+        json={"comment": comment},
+    ):
+        return comment
     return None
 
 
