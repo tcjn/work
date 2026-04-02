@@ -289,7 +289,9 @@ def _web_post(path: str, **kwargs) -> bool:
 # ---------- newsfeed ----------
 
 _API_FEED_ENDPOINTS = [
-    # OAuth feed endpoints on connectapi.garmin.com
+    # Current activities endpoint (used by newer Garmin API wrappers).
+    "/activitylist-service/activities/search/activities",
+    # Legacy feed endpoints retained as fallbacks.
     "/activitylist-service/activities/subscriptionFeed",
     "/activitylist-service/activities/subscriptions",
 ]
@@ -298,7 +300,9 @@ _API_FEED_ENDPOINTS = [
 _FEED_ENDPOINTS = _API_FEED_ENDPOINTS
 
 _WEB_FEED_ENDPOINTS = [
-    # Browser feed endpoints on connect.garmin.com
+    # Current activities endpoint via web proxy.
+    "/modern/proxy/activitylist-service/activities/search/activities",
+    # Legacy feed endpoints retained as fallbacks.
     "/modern/proxy/activitylist-service/activities/subscriptionFeed",
     "/modern/proxy/activitylist-service/activities/subscriptions",
 ]
@@ -308,7 +312,7 @@ def _parse_activities(raw) -> list:
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
-        for key in ("activityList", "activities", "feedList", "items"):
+        for key in ("activityList", "activities", "feedList", "items", "results"):
             val = raw.get(key)
             if val:
                 return val
