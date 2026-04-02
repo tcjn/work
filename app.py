@@ -175,8 +175,36 @@ def _looks_like_activity(item: object) -> bool:
 
 
 def _extract_activities(payload: object) -> list[dict]:
+    def _extract_from_feed_entry(entry: dict) -> list[dict]:
+        nested: list[dict] = []
+        for nested_key in (
+            "activity",
+            "activityDTO",
+            "activitySummary",
+            "entity",
+            "latestActivity",
+        ):
+            nested_item = entry.get(nested_key)
+            if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
+                nested.append(nested_item)
+
+        for nested_list_key in ("activities", "activityList", "items", "results"):
+            nested_list = entry.get(nested_list_key)
+            if isinstance(nested_list, list):
+                nested.extend(_extract_activities(nested_list))
+        return nested
+
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict) and _looks_like_activity(item)]
+        direct = [item for item in payload if isinstance(item, dict) and _looks_like_activity(item)]
+        if direct:
+            return direct
+
+        nested: list[dict] = []
+        for item in payload:
+            if isinstance(item, dict):
+                nested.extend(_extract_from_feed_entry(item))
+        if nested:
+            return nested
 
     if isinstance(payload, dict):
         for key in ("activityList", "activities", "items", "results", "feedItems"):
@@ -188,10 +216,7 @@ def _extract_activities(payload: object) -> list[dict]:
                 nested: list[dict] = []
                 for entry in value:
                     if isinstance(entry, dict):
-                        for nested_key in ("activity", "activityDTO", "activitySummary", "entity"):
-                            nested_item = entry.get(nested_key)
-                            if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
-                                nested.append(nested_item)
+                        nested.extend(_extract_from_feed_entry(entry))
                 if nested:
                     return nested
 
@@ -206,25 +231,58 @@ def _extract_activities(payload: object) -> list[dict]:
 
 
 def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
-    for endpoint in endpoints:
-        payload = garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
-        activities = _extract_activities(payload)
-        if activities:
-            logging.info("Using feed endpoint '%s' (activities=%s)", endpoint, len(activities))
-            return activities
+    def _get_connectapi(endpoint: str) -> object:
+        return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
 
-        if isinstance(payload, dict):
-            logging.warning(
-                "Feed endpoint '%s' returned 0 activities; payload keys=%s",
-                endpoint,
-                sorted(payload.keys())[:12],
-            )
-        else:
-            logging.warning(
-                "Feed endpoint '%s' returned 0 activities; payload type=%s",
-                endpoint,
-                type(payload).__name__,
-            )
+    def _get_modern_proxy(endpoint: str) -> object:
+        return garth.client.request(
+            "GET",
+            "connect",
+            f"/modern/proxy{endpoint}",
+            params={"start": 0, "limit": limit},
+        ).json()
+
+    for endpoint in endpoints:
+        strategies = (
+            ("connectapi", _get_connectapi),
+            ("modern/proxy", _get_modern_proxy),
+        )
+        for strategy_name, strategy in strategies:
+            try:
+                payload = strategy(endpoint)
+            except Exception as exc:
+                logging.warning(
+                    "Feed endpoint '%s' via %s failed: %s",
+                    endpoint,
+                    strategy_name,
+                    exc,
+                )
+                continue
+
+            activities = _extract_activities(payload)
+            if activities:
+                logging.info(
+                    "Using feed endpoint '%s' via %s (activities=%s)",
+                    endpoint,
+                    strategy_name,
+                    len(activities),
+                )
+                return activities
+
+            if isinstance(payload, dict):
+                logging.warning(
+                    "Feed endpoint '%s' via %s returned 0 activities; payload keys=%s",
+                    endpoint,
+                    strategy_name,
+                    sorted(payload.keys())[:12],
+                )
+            else:
+                logging.warning(
+                    "Feed endpoint '%s' via %s returned 0 activities; payload type=%s",
+                    endpoint,
+                    strategy_name,
+                    type(payload).__name__,
+                )
 
     return []
 
