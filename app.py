@@ -8,6 +8,7 @@ import requests as _requests
 from datetime import datetime, timezone
 
 import garth
+from garminconnect import Garmin
 from garth.exc import GarthHTTPError
 
 
@@ -47,12 +48,62 @@ POLISH_COMMENTS = [
 
 LIKED_ACTIVITIES_FILE  = "/data/liked_activities.json"
 HISTORY_FILE           = "/data/history.json"
-TOKEN_STORE            = os.getenv("TOKEN_STORE", "/data/tokens")
+TOKEN_STORE            = "/data/tokens"
+TOKEN_STORE_FILE       = "/data/garmin_tokens.json"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS           = os.getenv("ADD_COMMENTS", "true").lower() == "true"
 
 CONNECT_BASE = "https://connect.garmin.com"
 SSO_BASE     = "https://sso.garmin.com/sso"
+gc_client: Garmin | None = None
+
+
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
+
+
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
+
+
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
+
+
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
 
 
 def _url_host(url: str) -> str:
@@ -109,11 +160,13 @@ def append_history(entry: dict) -> None:
 # ---------- auth ----------
 
 def login_with_retry(email: str, password: str) -> None:
+    global gc_client
     delays = [30, 60, 120, 300]
     last_exc = None
     for attempt, delay in enumerate(delays, start=1):
         try:
-            garth.login(email, password)
+            gc_client = Garmin(email, password)
+            gc_client.login(tokenstore=TOKEN_STORE_FILE)
             logger.info("Successfully logged in to Garmin Connect")
             return
         except Exception as e:
@@ -124,6 +177,12 @@ def login_with_retry(email: str, password: str) -> None:
             else:
                 raise
     raise last_exc
+
+
+def _session():
+    if gc_client is not None:
+        return gc_client.garth.sess
+    return garth.client.sess
 
 
 def _sso_web_cookie_exchange() -> bool:
@@ -137,7 +196,7 @@ def _sso_web_cookie_exchange() -> bool:
     (no credentials needed), which sets the web session cookies in garth.client.sess.
     """
     try:
-        sess = garth.client.sess
+        sess = _session()
         r = sess.get(
             f"{SSO_BASE}/signin",
             params={"service": f"{CONNECT_BASE}/modern"},
@@ -163,7 +222,7 @@ def _sso_web_login_full(email: str, password: str) -> bool:
     all subsequent web requests automatically carry them.
     """
     try:
-        sess = garth.client.sess
+        sess = _session()
         MODERN = f"{CONNECT_BASE}/modern"
         params = {
             "service": MODERN,
@@ -209,19 +268,19 @@ def _sso_web_login_full(email: str, password: str) -> bool:
 
 
 def ensure_authenticated(email: str, password: str) -> None:
-    token_store = _normalized_token_store(TOKEN_STORE)
-    os.makedirs(token_store, exist_ok=True)
+    global gc_client
+    os.makedirs(TOKEN_STORE, exist_ok=True)
 
-    # Step 1: OAuth via garth (needed for connectapi.garmin.com endpoints)
+    # Step 1: OAuth via python-garminconnect (mobile SSO flow)
     try:
-        garth.load(token_store)
-        garth.client.connectapi("/userprofile-service/userprofile/personal-information")
+        gc_client = Garmin(email, password)
+        gc_client.login(tokenstore=TOKEN_STORE_FILE)
+        gc_client.connectapi("/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved OAuth session tokens")
     except Exception:
         logger.info("No valid saved session, logging in via OAuth...")
         login_with_retry(email, password)
-        garth.save(token_store)
-        logger.info("OAuth tokens saved")
+        logger.info(f"OAuth tokens saved to {TOKEN_STORE_FILE}")
 
     # Step 2: Web session cookies for connect.garmin.com/modern/proxy endpoints
     # Try fast exchange first (reuses existing sso.garmin.com cookies from garth),
@@ -233,7 +292,7 @@ def ensure_authenticated(email: str, password: str) -> None:
             logger.warning("Could not establish web session — feed may fail")
 
     # Update session headers for web requests
-    garth.client.sess.headers.update({
+    _session().headers.update({
         "NK": "NT",
         "Accept": "application/json, text/plain, */*",
         "Referer": f"{CONNECT_BASE}/app/newsfeed",
@@ -248,19 +307,24 @@ def ensure_authenticated(email: str, password: str) -> None:
 def _garth_api_get(path: str, **kwargs):
     """GET connectapi.garmin.com with OAuth Bearer (garth managed)."""
     try:
-        resp = garth.client.connectapi(path, params=kwargs.get("params"))
+        if gc_client is not None:
+            resp = gc_client.connectapi(path, params=kwargs.get("params"))
+        else:
+            resp = garth.client.connectapi(path, params=kwargs.get("params"))
         return resp
     except GarthHTTPError as e:
         raise
 
 
 def _garth_api_request(path: str, method: str, **kwargs):
+    if gc_client is not None:
+        return gc_client.connectapi(path, method=method, **kwargs)
     return garth.client.connectapi(path, method=method, **kwargs)
 
 
 def _web_get(path: str, **kwargs):
     """GET connect.garmin.com using SSO session cookies."""
-    sess = garth.client.sess
+    sess = _session()
     r = sess.get(f"{CONNECT_BASE}{path}", **kwargs)
     logger.debug(f"WEB GET {path} → {r.status_code}")
     r.raise_for_status()
@@ -281,7 +345,7 @@ def _web_get(path: str, **kwargs):
 
 
 def _web_put(path: str, **kwargs) -> bool:
-    sess = garth.client.sess
+    sess = _session()
     try:
         r = sess.put(f"{CONNECT_BASE}{path}", **kwargs)
         r.raise_for_status()
@@ -292,7 +356,7 @@ def _web_put(path: str, **kwargs) -> bool:
 
 
 def _web_post(path: str, **kwargs) -> bool:
-    sess = garth.client.sess
+    sess = _session()
     try:
         r = sess.post(f"{CONNECT_BASE}{path}", **kwargs)
         r.raise_for_status()
