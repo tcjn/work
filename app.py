@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 import garth
+import requests
 from garth.exc import GarthHTTPError
 
 CONNECT_API_FEED = "/activitylist-service/activities/search/activities"
