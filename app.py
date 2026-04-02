@@ -13,6 +13,8 @@ from garth.exc import GarthHTTPError
 
 CONNECT_API_FEED = "/activitylist-service/activities/search/activities"
 CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
+LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
+STARTUP_AUTH_RETRY_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -87,17 +89,72 @@ def append_history(path: Path, entry: dict) -> None:
     path.write_text(json.dumps(history, indent=2))
 
 
+def _extract_status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    return None
+
+
+def _is_retriable_login_error(exc: Exception) -> bool:
+    if _extract_status_code(exc) == 429:
+        return True
+    return isinstance(exc, (GarthHTTPError, requests.RequestException))
+
+
+def login_with_retry(config: Config) -> None:
+    for attempt, delay in enumerate(LOGIN_BACKOFF_SECONDS, start=1):
+        try:
+            # garth.login performs cookie exchange, sign-in page retrieval, and form post.
+            # Keep all of that behind controlled retries so temporary SSO failures do not
+            # crash-loop the process.
+            garth.login(config.email, config.password)
+            garth.save(str(config.token_store))
+            logging.info("Login successful and tokens saved")
+            return
+        except Exception as exc:
+            if not _is_retriable_login_error(exc):
+                raise
+
+            status_code = _extract_status_code(exc)
+            if status_code == 429:
+                logging.warning(
+                    "Garmin login rate-limited (429) on attempt %s/%s; retrying in %ss",
+                    attempt,
+                    len(LOGIN_BACKOFF_SECONDS),
+                    delay,
+                )
+            else:
+                logging.warning(
+                    "Garmin login/SSO transient error on attempt %s/%s; retrying in %ss: %s",
+                    attempt,
+                    len(LOGIN_BACKOFF_SECONDS),
+                    delay,
+                    exc,
+                )
+            time.sleep(delay)
+
+    # Final attempt after backoff schedule is exhausted.
+    garth.login(config.email, config.password)
+    garth.save(str(config.token_store))
+    logging.info("Login successful and tokens saved")
+
+
 def ensure_login(config: Config) -> None:
     config.token_store.mkdir(parents=True, exist_ok=True)
     try:
-        garth.load(str(config.token_store))
+        garth.resume(str(config.token_store))
         garth.client.connectapi("/userprofile-service/userprofile/personal-information")
         logging.info("Reused saved Garmin tokens")
     except Exception:
-        logging.info("Token load failed; logging in with credentials")
-        garth.login(config.email, config.password)
-        garth.save(str(config.token_store))
-        logging.info("Login successful and tokens saved")
+        logging.info("Token resume failed; logging in with credentials")
+        login_with_retry(config)
 
 
 def fetch_feed(limit: int) -> list[dict]:
@@ -197,7 +254,18 @@ def main() -> None:
     seen_path = config.data_dir / "seen_activities.json"
 
     logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s", config.mode, config.feed_limit)
-    ensure_login(config)
+
+    while True:
+        try:
+            ensure_login(config)
+            break
+        except Exception as exc:
+            logging.exception(
+                "Initial authentication failed; retrying in %ss: %s",
+                STARTUP_AUTH_RETRY_SECONDS,
+                exc,
+            )
+            time.sleep(STARTUP_AUTH_RETRY_SECONDS)
 
     while True:
         try:
