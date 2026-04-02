@@ -167,70 +167,33 @@ def ensure_login(config: Config) -> None:
         logging.info("Token resume failed; logging in with credentials")
         login_with_retry(config)
 
-
 def _looks_like_activity(item: object) -> bool:
     if not isinstance(item, dict):
         return False
-
-    direct_id = item.get("activityId")
-    legacy_id = item.get("id")
-    if isinstance(direct_id, int) or (isinstance(direct_id, str) and direct_id.isdigit()):
-        return True
-    if isinstance(legacy_id, int) or (isinstance(legacy_id, str) and legacy_id.isdigit()):
-        return True
-
-    return False
-
-
-def _normalize_activity_shape(item: dict) -> dict:
-    if "activityId" in item:
-        return item
-    if "id" in item and (isinstance(item["id"], int) or str(item["id"]).isdigit()):
-        normalized = dict(item)
-        normalized["activityId"] = int(item["id"])
-        return normalized
-    return item
+    activity_id = item.get("activityId")
+    return isinstance(activity_id, int) or str(activity_id).isdigit()
 
 
 def _extract_activities(payload: object) -> list[dict]:
     if isinstance(payload, list):
-        direct = [_normalize_activity_shape(item) for item in payload if isinstance(item, dict) and _looks_like_activity(item)]
-        if direct:
-            return direct
-
-        nested: list[dict] = []
-        for entry in payload:
-            if not isinstance(entry, dict):
-                continue
-            for nested_key in (
-                "activity",
-                "activityDTO",
-                "activitySummary",
-                "entity",
-                "itemData",
-                "content",
-                "payload",
-                "object",
-            ):
-                nested_item = entry.get(nested_key)
-                if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
-                    nested.append(_normalize_activity_shape(nested_item))
-        if nested:
-            return nested
-
-        recursive: list[dict] = []
-        for entry in payload:
-            recursive.extend(_extract_activities(entry))
-            if recursive:
-                return recursive
-        return []
+        return [item for item in payload if isinstance(item, dict) and _looks_like_activity(item)]
 
     if isinstance(payload, dict):
         for key in ("activityList", "activities", "items", "results", "feedItems"):
             value = payload.get(key)
-            extracted = _extract_activities(value)
-            if extracted:
-                return extracted
+            if isinstance(value, list):
+                direct = [item for item in value if isinstance(item, dict) and _looks_like_activity(item)]
+                if direct:
+                    return direct
+                nested: list[dict] = []
+                for entry in value:
+                    if isinstance(entry, dict):
+                        for nested_key in ("activity", "activityDTO", "activitySummary", "entity"):
+                            nested_item = entry.get(nested_key)
+                            if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
+                                nested.append(nested_item)
+                if nested:
+                    return nested
 
         # Recursive fallback to handle unknown wrapper shapes.
         recursive: list[dict] = []
@@ -269,7 +232,7 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
 
 
 def _activity_id(activity: dict) -> int | None:
-    value = activity.get("activityId", activity.get("id"))
+    value = activity.get("activityId")
     if isinstance(value, int):
         return value
     if isinstance(value, str) and value.isdigit():
@@ -360,7 +323,7 @@ def main() -> None:
     history_path = config.data_dir / "history.json"
     seen_path = config.data_dir / "seen_activities.json"
 
-    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s | feed_endpoints=%s", config.mode, config.feed_limit, config.feed_endpoints)
+    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s", config.mode, config.feed_limit)
 
     while True:
         try:
