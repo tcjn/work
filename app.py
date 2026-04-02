@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,21 +11,8 @@ import garth
 import requests
 from garth.exc import GarthHTTPError
 
-CONNECT_BASE = "https://connect.garmin.com"
-SSO_BASE = "https://sso.garmin.com/sso"
-
-API_FEED_ENDPOINTS = [
-    "/activitylist-service/activities/search/activities",
-    "/activitylist-service/activities/subscriptionFeed",
-    "/activitylist-service/activities/subscriptions",
-]
-WEB_FEED_ENDPOINTS = [
-    "/modern/proxy/activitylist-service/activities/search/activities",
-    "/modern/proxy/activitylist-service/activities/subscriptionFeed",
-    "/modern/proxy/activitylist-service/activities/subscriptions",
-]
+CONNECT_API_FEED = "/activitylist-service/activities/search/activities"
 CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
-WEB_KUDOS = "/modern/proxy/social-service/kudos/{activity_id}"
 
 
 @dataclass(frozen=True)
@@ -101,69 +87,6 @@ def append_history(path: Path, entry: dict) -> None:
     path.write_text(json.dumps(history, indent=2))
 
 
-def _is_connect_url(url: str) -> bool:
-    try:
-        return requests.utils.urlparse(url).netloc.lower() == "connect.garmin.com"
-    except Exception:
-        return False
-
-
-def ensure_web_session(config: Config) -> None:
-    sess = garth.client.sess
-    # Fast SSO cookie exchange using current login cookies.
-    response = sess.get(
-        f"{SSO_BASE}/signin",
-        params={"service": f"{CONNECT_BASE}/modern"},
-        allow_redirects=True,
-        timeout=20,
-    )
-    if _is_connect_url(response.url):
-        logging.info("Web session established via SSO cookie exchange")
-        return
-
-    # Full SSO form login fallback.
-    params = {
-        "service": f"{CONNECT_BASE}/modern",
-        "gauthHost": SSO_BASE,
-        "locale": "en_US",
-        "id": "gauth-widget",
-        "clientId": "GarminConnect",
-        "consumeServiceTicket": "false",
-        "embedWidget": "false",
-        "generateExtraServiceTicket": "true",
-    }
-    signin_page = sess.get(f"{SSO_BASE}/signin", params=params, timeout=20)
-    csrf_match = re.search(r'name="_csrf"\s+value="(.+?)"', signin_page.text)
-    if not csrf_match:
-        logging.warning("Could not parse CSRF token for web SSO login")
-        return
-
-    login_response = sess.post(
-        f"{SSO_BASE}/signin",
-        params=params,
-        data={
-            "username": config.email,
-            "password": config.password,
-            "embed": "false",
-            "_csrf": csrf_match.group(1),
-        },
-        allow_redirects=True,
-        timeout=20,
-    )
-    if _is_connect_url(login_response.url):
-        logging.info("Web session established via full SSO login")
-    else:
-        logging.warning("Web SSO fallback did not reach connect.garmin.com")
-
-    sess.headers.update(
-        {
-            "NK": "NT",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"{CONNECT_BASE}/app/newsfeed",
-        }
-    )
-
-
 def ensure_login(config: Config) -> None:
     config.token_store.mkdir(parents=True, exist_ok=True)
     try:
@@ -176,67 +99,23 @@ def ensure_login(config: Config) -> None:
         garth.save(str(config.token_store))
         logging.info("Login successful and tokens saved")
 
-    ensure_web_session(config)
 
+def fetch_feed(limit: int) -> list[dict]:
+    payload = garth.client.connectapi(CONNECT_API_FEED, params={"start": 0, "limit": limit})
 
-def parse_feed(payload: object) -> list[dict]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("activityList", "activities", "results", "items", "feedList"):
+        for key in ("activityList", "activities", "results", "items"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
     return []
 
 
-def fetch_feed(limit: int) -> list[dict]:
-    page_size = min(limit, 20)
-
-    for endpoint in API_FEED_ENDPOINTS:
-        items: list[dict] = []
-        try:
-            for start in range(0, limit, page_size):
-                payload = garth.client.connectapi(endpoint, params={"start": start, "limit": page_size})
-                parsed = parse_feed(payload)
-                items.extend(parsed)
-                if len(parsed) < page_size:
-                    break
-            if items:
-                logging.info("Feed source: API %s (%s items)", endpoint, len(items))
-                return items[:limit]
-        except Exception as exc:
-            logging.warning("API feed endpoint failed %s: %s", endpoint, exc)
-
-    sess = garth.client.sess
-    for endpoint in WEB_FEED_ENDPOINTS:
-        items = []
-        try:
-            for start in range(0, limit, page_size):
-                response = sess.get(
-                    f"{CONNECT_BASE}{endpoint}",
-                    params={"start": start, "limit": page_size},
-                    timeout=20,
-                )
-                response.raise_for_status()
-                if "json" not in response.headers.get("content-type", ""):
-                    break
-                parsed = parse_feed(response.json())
-                items.extend(parsed)
-                if len(parsed) < page_size:
-                    break
-            if items:
-                logging.info("Feed source: WEB %s (%s items)", endpoint, len(items))
-                return items[:limit]
-        except Exception as exc:
-            logging.warning("WEB feed endpoint failed %s: %s", endpoint, exc)
-
-    return []
-
-
 def iter_targets(activities: Iterable[dict], mode: str, already_liked: set[int]) -> list[dict]:
     if mode == "last10":
-        return [a for a in activities if isinstance(a.get("activityId"), int)]
+        return list(activities)
 
     targets: list[dict] = []
     for activity in activities:
@@ -257,17 +136,13 @@ def like_activity(activity: dict) -> bool:
         return False
 
     try:
-        garth.client.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
+        garth.client.connectapi(
+            CONNECT_API_KUDOS.format(activity_id=activity_id),
+            method="PUT",
+        )
         return True
     except GarthHTTPError as exc:
-        logging.warning("API like failed for %s: %s", activity_id, exc)
-
-    try:
-        response = garth.client.sess.put(f"{CONNECT_BASE}{WEB_KUDOS.format(activity_id=activity_id)}", timeout=20)
-        response.raise_for_status()
-        return True
-    except Exception as exc:
-        logging.warning("WEB like failed for %s: %s", activity_id, exc)
+        logging.warning("Failed to like activity %s: %s", activity_id, exc)
         return False
 
 
@@ -278,8 +153,9 @@ def run_cycle(config: Config, liked_path: Path, history_path: Path, seen_path: P
     liked_ids = load_json_set(liked_path)
     seen_ids = load_json_set(seen_path)
 
-    candidates = iter_targets(feed, config.mode, liked_ids)
+    candidates = [a for a in iter_targets(feed, config.mode, liked_ids) if isinstance(a.get("activityId"), int)]
 
+    # In "new" mode, only process activities not seen in previous cycle.
     if config.mode == "new":
         candidates = [a for a in candidates if a["activityId"] not in seen_ids]
 
