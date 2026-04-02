@@ -95,25 +95,54 @@ def login_with_retry(email: str, password: str) -> None:
     raise last_exc
 
 
+def _exchange_for_web_session() -> None:
+    """Exchange OAuth2 token for connect.garmin.com web session cookies.
+
+    Garth's SSO flow never visits connect.garmin.com, so modern/proxy endpoints
+    have no session cookies.  The di-oauth/exchange endpoint converts a Bearer
+    token into those cookies so subsequent requests to /modern/proxy/ work.
+    """
+    try:
+        resp = garth.client.request(
+            "GET", "connect", "/modern/di-oauth/exchange",
+            api=True,
+            headers={"NK": "NT"},
+        )
+        logger.debug(
+            f"di-oauth exchange: status={resp.status_code} "
+            f"cookies={list(garth.client.sess.cookies.keys())}"
+        )
+    except Exception as e:
+        logger.debug(f"di-oauth exchange skipped: {e}")
+
+
 def ensure_authenticated(email: str, password: str) -> None:
     os.makedirs(TOKEN_STORE, exist_ok=True)
     try:
         garth.load(TOKEN_STORE)
         garth.client.connectapi("/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved session tokens")
+        _exchange_for_web_session()
         return
     except Exception:
         logger.info("No valid saved session, logging in...")
     login_with_retry(email, password)
     garth.save(TOKEN_STORE)
     logger.info("Tokens saved to disk")
+    _exchange_for_web_session()
 
 
 # ---------- HTTP helpers (garth.client.request → correct subdomain + Bearer) ----------
 # garth.client.request(method, subdomain, path, api=True) builds:
 #   https://{subdomain}.garmin.com{path}  + Authorization: Bearer <oauth2>
 
-_WEB_HEADERS = {"NK": "NT", "Accept": "application/json, text/plain, */*"}
+_WEB_HEADERS = {
+    "NK": "NT",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://connect.garmin.com/app/newsfeed",
+    "X-app-ver": "4.70.1.0",
+    "di-backend": "connectapi.garmin.com",
+}
 
 
 def _garth_get(subdomain: str, path: str, **kwargs):
@@ -166,13 +195,20 @@ def _garth_post(subdomain: str, path: str, **kwargs) -> bool:
 # ---------- newsfeed ----------
 
 # Each entry: (subdomain, path_template)
-# We try connect.garmin.com first (web session endpoint), then connectapi as fallback
+# connect.garmin.com/modern/proxy/* routes to internal services via di-backend header
+# connectapi.garmin.com/* uses OAuth Bearer directly
 _FEED_CANDIDATES = [
+    # modern proxy — relies on di-oauth exchange cookies + Bearer
     ("connect", "/modern/proxy/activitylist-service/activities/subscriptionFeed"),
-    ("connect", "/activitylist-service/activities/subscriptionFeed"),
     ("connect", "/modern/proxy/activitylist-service/activities/subscriptions"),
-    ("connectapi", "/activitylist-service/activities/subscriptionFeed"),
+    # direct on connect (no proxy prefix)
+    ("connect", "/activitylist-service/activities/subscriptionFeed"),
+    # connectapi variants — some may still be alive
     ("connectapi", "/activitylist-service/activities/subscriptions"),
+    ("connectapi", "/activitylist-service/activities/subscriptionFeed"),
+    # social-service paths seen in reverse-engineering
+    ("connectapi", "/social-service/social/connections/activities"),
+    ("connectapi", "/community-user-api/community/activities/following"),
 ]
 
 
@@ -221,14 +257,14 @@ def get_feed(limit: int = 10) -> list:
 # ---------- kudos / comment ----------
 
 _KUDO_CANDIDATES = [
+    ("connectapi", "/activity-service/activity/{id}/kudos"),
     ("connect",    "/modern/proxy/social-service/kudos/{id}"),
     ("connect",    "/modern/proxy/activity-service/activity/{id}/kudos"),
-    ("connectapi", "/activity-service/activity/{id}/kudos"),
 ]
 
 _COMMENT_CANDIDATES = [
-    ("connect",    "/modern/proxy/comment-service/comment/activity/{id}"),
     ("connectapi", "/comment-service/comment/activity/{id}"),
+    ("connect",    "/modern/proxy/comment-service/comment/activity/{id}"),
 ]
 
 
