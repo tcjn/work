@@ -47,12 +47,35 @@ POLISH_COMMENTS = [
 
 LIKED_ACTIVITIES_FILE  = "/data/liked_activities.json"
 HISTORY_FILE           = "/data/history.json"
-TOKEN_STORE            = "/data/tokens"
+TOKEN_STORE            = os.getenv("TOKEN_STORE", "/data/tokens")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 ADD_COMMENTS           = os.getenv("ADD_COMMENTS", "true").lower() == "true"
 
 CONNECT_BASE = "https://connect.garmin.com"
 SSO_BASE     = "https://sso.garmin.com/sso"
+
+
+def _url_host(url: str) -> str:
+    try:
+        return _requests.utils.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_connect_modern_url(url: str) -> bool:
+    host = _url_host(url)
+    return host == "connect.garmin.com"
+
+
+def _normalized_token_store(path: str) -> str:
+    # garth expects a directory that contains oauth1_token.json/oauth2_token.json
+    if path.lower().endswith(".json"):
+        normalized = os.path.dirname(path) or "/data/tokens"
+        logger.warning(
+            f"TOKEN_STORE looks like a file path ({path}); using directory {normalized}"
+        )
+        return normalized
+    return path
 
 
 # ---------- persistence ----------
@@ -126,8 +149,8 @@ def _sso_web_cookie_exchange() -> bool:
             f"status={r.status_code} "
             f"cookies={list(sess.cookies.keys())}"
         )
-        # Success: we should have landed on connect.garmin.com
-        return "connect.garmin.com" in r.url
+        # Success: we should have landed on connect.garmin.com host (not just a query param)
+        return _is_connect_modern_url(r.url)
     except Exception as e:
         logger.warning(f"SSO web exchange failed: {e}")
         return False
@@ -178,24 +201,26 @@ def _sso_web_login_full(email: str, password: str) -> bool:
             f"Full SSO web login: final_url={r.url} "
             f"cookies={list(sess.cookies.keys())}"
         )
-        return "connect.garmin.com" in r.url
+        # Treat only a real host redirect as success (query-string "service=" is not enough)
+        return _is_connect_modern_url(r.url)
     except Exception as e:
         logger.warning(f"Full SSO web login failed: {e}")
         return False
 
 
 def ensure_authenticated(email: str, password: str) -> None:
-    os.makedirs(TOKEN_STORE, exist_ok=True)
+    token_store = _normalized_token_store(TOKEN_STORE)
+    os.makedirs(token_store, exist_ok=True)
 
     # Step 1: OAuth via garth (needed for connectapi.garmin.com endpoints)
     try:
-        garth.load(TOKEN_STORE)
+        garth.load(token_store)
         garth.client.connectapi("/userprofile-service/userprofile/personal-information")
         logger.info("Reused saved OAuth session tokens")
     except Exception:
         logger.info("No valid saved session, logging in via OAuth...")
         login_with_retry(email, password)
-        garth.save(TOKEN_STORE)
+        garth.save(token_store)
         logger.info("OAuth tokens saved")
 
     # Step 2: Web session cookies for connect.garmin.com/modern/proxy endpoints
@@ -207,7 +232,7 @@ def ensure_authenticated(email: str, password: str) -> None:
         if not _sso_web_login_full(email, password):
             logger.warning("Could not establish web session — feed may fail")
 
-    # Update garth session headers for web requests
+    # Update session headers for web requests
     garth.client.sess.headers.update({
         "NK": "NT",
         "Accept": "application/json, text/plain, */*",
@@ -227,6 +252,10 @@ def _garth_api_get(path: str, **kwargs):
         return resp
     except GarthHTTPError as e:
         raise
+
+
+def _garth_api_request(path: str, method: str, **kwargs):
+    return garth.client.connectapi(path, method=method, **kwargs)
 
 
 def _web_get(path: str, **kwargs):
@@ -276,13 +305,20 @@ def _web_post(path: str, **kwargs) -> bool:
 # ---------- newsfeed ----------
 
 _API_FEED_ENDPOINTS = [
-    # OAuth feed endpoints on connectapi.garmin.com
+    # Current activities endpoint (used by newer Garmin API wrappers).
+    "/activitylist-service/activities/search/activities",
+    # Legacy feed endpoints retained as fallbacks.
     "/activitylist-service/activities/subscriptionFeed",
     "/activitylist-service/activities/subscriptions",
 ]
 
+# Backward-compatible alias for any older references/logging that still use this name.
+_FEED_ENDPOINTS = _API_FEED_ENDPOINTS
+
 _WEB_FEED_ENDPOINTS = [
-    # Browser feed endpoints on connect.garmin.com
+    # Current activities endpoint via web proxy.
+    "/modern/proxy/activitylist-service/activities/search/activities",
+    # Legacy feed endpoints retained as fallbacks.
     "/modern/proxy/activitylist-service/activities/subscriptionFeed",
     "/modern/proxy/activitylist-service/activities/subscriptions",
 ]
@@ -292,7 +328,7 @@ def _parse_activities(raw) -> list:
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
-        for key in ("activityList", "activities", "feedList", "items"):
+        for key in ("activityList", "activities", "feedList", "items", "results"):
             val = raw.get(key)
             if val:
                 return val
@@ -304,7 +340,7 @@ def get_feed(limit: int = 10) -> list:
     page_size = min(limit, 20)
     auth_failures = 0
 
-    for ep in _FEED_ENDPOINTS:
+    for ep in _API_FEED_ENDPOINTS:
         collected: list = []
         try:
             for start in range(0, limit, page_size):
@@ -350,9 +386,6 @@ def get_feed(limit: int = 10) -> list:
     if auth_failures == len(_WEB_FEED_ENDPOINTS):
         raise SessionExpiredError("All web feed endpoints redirected to sign-in")
 
-    if auth_failures == len(_FEED_ENDPOINTS):
-        raise SessionExpiredError("All feed endpoints redirected to sign-in")
-
     logger.warning("All feed endpoints returned 0 activities")
     return []
 
@@ -362,7 +395,7 @@ def get_feed(limit: int = 10) -> list:
 def kudo_activity(activity_id: int) -> bool:
     # Try OAuth (connectapi) first — more reliable than web session for writes
     try:
-        garth.client.connectapi(
+        _garth_api_request(
             f"/activity-service/activity/{activity_id}/kudos",
             method="PUT",
         )
@@ -378,7 +411,7 @@ def comment_activity(activity_id: int) -> str | None:
     comment = random.choice(POLISH_COMMENTS)
     # Try OAuth first
     try:
-        garth.client.connectapi(
+        _garth_api_request(
             f"/comment-service/comment/activity/{activity_id}",
             method="POST",
             json={"comment": comment},
@@ -488,8 +521,18 @@ def main():
             logger.error(f"Feed processing error: {e}")
             try:
                 ensure_authenticated(email, password)
-                should_sleep = False
-                logger.info("Re-authenticated successfully; retrying feed immediately")
+                try:
+                    # Only skip backoff if we can verify feed access after re-auth.
+                    get_feed(limit=1)
+                    should_sleep = False
+                    logger.info(
+                        "Re-authenticated and verified feed access; retrying immediately"
+                    )
+                except Exception as probe_ex:
+                    logger.warning(
+                        f"Re-auth succeeded but feed probe failed: {probe_ex}; "
+                        "keeping normal backoff"
+                    )
             except Exception as ex:
                 logger.error(f"Re-auth failed: {ex}")
 
