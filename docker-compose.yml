@@ -5,10 +5,15 @@ services:
     environment:
       - GARMIN_EMAIL=${GARMIN_EMAIL}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
-      # How often to check for new activities (in seconds). Default: 3600 (1 hour)
-      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-3600}
-      # Set to "false" to only like without commenting
-      - ADD_COMMENTS=${ADD_COMMENTS:-true}
+      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-300}
+      - FEED_LIMIT=${FEED_LIMIT:-10}
+      # LIKE_MODE options:
+      # - new: only like activities that newly appear in feed between checks
+      # - last10: always try to like last FEED_LIMIT activities
+      - LIKE_MODE=${LIKE_MODE:-new}
+      # Set RUN_ONCE=true to process one cycle and exit (useful for cron/jobs)
+      - RUN_ONCE=${RUN_ONCE:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - garmin_data:/data
 
