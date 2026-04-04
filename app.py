@@ -8,9 +8,13 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Iterable
 
-import garth
 import requests
-from garth.exc import GarthHTTPError
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 CONNECT_API_FEEDS = (
     "/activitylist-service/activities/subscribed",
@@ -19,6 +23,7 @@ CONNECT_API_FEEDS = (
 CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
+api: Garmin | None = None
 
 
 class AuthExpiredError(RuntimeError):
@@ -164,14 +169,23 @@ def _extract_status_code(exc: Exception) -> int | None:
 def _is_retriable_login_error(exc: Exception) -> bool:
     if _extract_status_code(exc) == 429:
         return True
-    return isinstance(exc, (GarthHTTPError, requests.RequestException))
+    return isinstance(
+        exc,
+        (
+            GarminConnectAuthenticationError,
+            GarminConnectConnectionError,
+            GarminConnectTooManyRequestsError,
+            requests.RequestException,
+        ),
+    )
 
 
 def login_with_retry(config: Config) -> None:
+    global api
     for attempt, delay in enumerate(LOGIN_BACKOFF_SECONDS, start=1):
         try:
-            garth.login(config.email, config.password)
-            garth.save(str(config.token_store))
+            api = Garmin(email=config.email, password=config.password)
+            api.login(str(config.token_store))
             logging.info("Login successful and tokens saved")
             return
         except Exception as exc:
@@ -196,16 +210,18 @@ def login_with_retry(config: Config) -> None:
                 )
             time.sleep(delay)
 
-    garth.login(config.email, config.password)
-    garth.save(str(config.token_store))
+    api = Garmin(email=config.email, password=config.password)
+    api.login(str(config.token_store))
     logging.info("Login successful and tokens saved")
 
 
 def ensure_login(config: Config) -> None:
+    global api
     config.token_store.mkdir(parents=True, exist_ok=True)
     try:
-        garth.resume(str(config.token_store))
-        garth.client.connectapi("/userprofile-service/userprofile/personal-information")
+        api = Garmin()
+        api.login(str(config.token_store))
+        api.connectapi("/userprofile-service/userprofile/personal-information")
         logging.info("Reused saved Garmin tokens")
     except Exception:
         logging.info("Token resume failed; logging in with credentials")
@@ -281,6 +297,9 @@ def _extract_activities(payload: object) -> list[dict]:
 
 
 def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
+    if api is None:
+        raise RuntimeError("Garmin API client is not initialized")
+
     auth_failures = 0
     attempts = 0
 
@@ -292,22 +311,16 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         return status in (401, 403)
 
     def _get_connectapi(endpoint: str) -> object:
-        return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
+        return api.connectapi(endpoint, params={"start": 0, "limit": limit})
 
     def _get_modern_proxy(endpoint: str) -> object:
-        response = garth.client.request(
-            "GET",
-            "connect",
-            f"/modern/proxy{endpoint}",
-            params={"start": 0, "limit": limit},
-        )
         try:
-            return response.json()
-        except JSONDecodeError:
-            body_preview = response.text[:160].replace("\n", " ")
-            raise AuthExpiredError(
-                f"modern/proxy returned non-JSON (status={response.status_code} body='{body_preview}')"
-            ) from None
+            return api.connectwebproxy(
+                f"/modern/proxy{endpoint}",
+                params={"start": 0, "limit": limit},
+            )
+        except JSONDecodeError as exc:
+            raise AuthExpiredError("modern/proxy returned non-JSON") from exc
 
     for endpoint in endpoints:
         for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
@@ -362,14 +375,17 @@ def _new_items_since_marker(activities: list[dict], marker_id: int | None) -> li
 
 
 def like_activity(activity: dict) -> bool:
+    if api is None:
+        raise RuntimeError("Garmin API client is not initialized")
+
     activity_id = _activity_id(activity)
     if activity_id is None:
         return False
 
     try:
-        garth.client.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
+        api.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
         return True
-    except GarthHTTPError as exc:
+    except GarminConnectConnectionError as exc:
         logging.warning("Failed to like activity %s: %s", activity_id, exc)
         return False
 
