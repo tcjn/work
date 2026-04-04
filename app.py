@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -20,7 +21,14 @@ CONNECT_API_FEEDS = (
     "/activitylist-service/activities/search/activities",
     "/activitylist-service/activities/subscribed",
 )
-CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
+CONNECT_API_KUDOS_REQUESTS = (
+    ("PUT", "/activity-service/activity/{activity_id}/kudos"),
+    ("POST", "/activity-service/activity/{activity_id}/kudos"),
+    ("PUT", "/kudos-service/kudos/activity/{activity_id}"),
+    ("POST", "/kudos-service/kudos/activity/{activity_id}"),
+    ("PUT", "/kudos-service/v1/activities/{activity_id}/kudos"),
+    ("POST", "/kudos-service/v1/activities/{activity_id}/kudos"),
+)
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
 api: Garmin | None = None
@@ -162,6 +170,10 @@ def _extract_status_code(exc: Exception) -> int | None:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         return status_code
+
+    match = re.search(r"\b([45]\d{2})\b", str(exc))
+    if match:
+        return int(match.group(1))
 
     return None
 
@@ -339,6 +351,10 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         except JSONDecodeError as exc:
             raise AuthExpiredError("modern/proxy returned non-JSON") from exc
 
+    strategies: list[tuple[str, Callable[[str], object]]] = [("connectapi", _get_connectapi)]
+    if hasattr(api, "connectwebproxy"):
+        strategies.append(("modern/proxy", _get_modern_proxy))
+
     for endpoint in endpoints:
         for strategy_name, strategy in strategies:
             attempts += 1
@@ -399,12 +415,24 @@ def like_activity(activity: dict) -> bool:
     if activity_id is None:
         return False
 
-    try:
-        api.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
-        return True
-    except GarminConnectConnectionError as exc:
-        logging.warning("Failed to like activity %s: %s", activity_id, exc)
-        return False
+    errors: list[str] = []
+    for method, endpoint in CONNECT_API_KUDOS_REQUESTS:
+        path = endpoint.format(activity_id=activity_id)
+        try:
+            api.connectapi(path, method=method)
+            logging.info("Liked activity %s via %s %s", activity_id, method, path)
+            return True
+        except Exception as exc:
+            status = _extract_status_code(exc)
+            errors.append(f"{method} {path} -> {exc}")
+            if status in (401, 403):
+                raise AuthExpiredError(f"Kudos request unauthorized for {activity_id}") from exc
+            if status == 404:
+                continue
+            return False
+
+    logging.warning("Failed to like activity %s after %s attempts: %s", activity_id, len(errors), " | ".join(errors))
+    return False
 
 
 def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int, int]:
