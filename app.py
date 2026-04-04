@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Iterable
 
@@ -210,8 +211,20 @@ def ensure_login(config: Config) -> None:
 def _looks_like_activity(item: object) -> bool:
     if not isinstance(item, dict):
         return False
-    activity_id = item.get("activityId")
-    return isinstance(activity_id, int) or str(activity_id).isdigit()
+    if _activity_id(item) is not None:
+        return True
+    nested = item.get("activity")
+    return isinstance(nested, dict) and _activity_id(nested) is not None
+
+
+def _activity_id(activity: dict) -> int | None:
+    for key in ("activityId", "id", "activity_id"):
+        value = activity.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
 
 
 def _activity_id(activity: dict) -> int | None:
@@ -277,12 +290,19 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
 
     def _get_modern_proxy(endpoint: str) -> object:
-        return garth.client.request(
+        response = garth.client.request(
             "GET",
             "connect",
             f"/modern/proxy{endpoint}",
             params={"start": 0, "limit": limit},
-        ).json()
+        )
+        try:
+            return response.json()
+        except JSONDecodeError:
+            body_preview = response.text[:160].replace("\n", " ")
+            raise ValueError(
+                f"modern/proxy returned non-JSON (status={response.status_code} body='{body_preview}')"
+            ) from None
 
     for endpoint in endpoints:
         for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
