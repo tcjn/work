@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Iterable
 
@@ -29,9 +30,16 @@ class Config:
     check_interval_seconds: int
     feed_limit: int
     feed_endpoints: tuple[str, ...]
-    mode: str  # "new" or "last10"
     run_once: bool
     log_level: str
+    like_on_startup: bool
+    liked_cache_size: int
+
+
+@dataclass
+class State:
+    last_feed_head_id: int | None
+    liked_ids: list[int]
 
 
 def build_config() -> Config:
@@ -40,11 +48,7 @@ def build_config() -> Config:
     if not email or not password:
         raise ValueError("GARMIN_EMAIL and GARMIN_PASSWORD must be provided")
 
-    mode = os.getenv("LIKE_MODE", "new").strip().lower()
-    if mode not in {"new", "last10"}:
-        raise ValueError("LIKE_MODE must be 'new' or 'last10'")
-
-    feed_limit = int(os.getenv("FEED_LIMIT", "10"))
+    feed_limit = int(os.getenv("FEED_LIMIT", "25"))
     if feed_limit < 1:
         raise ValueError("FEED_LIMIT must be >= 1")
 
@@ -54,17 +58,22 @@ def build_config() -> Config:
     else:
         feed_endpoints = CONNECT_API_FEEDS
 
+    liked_cache_size = int(os.getenv("LIKED_CACHE_SIZE", "5000"))
+    if liked_cache_size < 100:
+        raise ValueError("LIKED_CACHE_SIZE must be >= 100")
+
     return Config(
         email=email,
         password=password,
         token_store=Path(os.getenv("TOKEN_STORE", "/data/tokens")),
         data_dir=Path(os.getenv("DATA_DIR", "/data")),
-        check_interval_seconds=max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))),
+        check_interval_seconds=max(20, int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))),
         feed_limit=feed_limit,
         feed_endpoints=feed_endpoints,
-        mode=mode,
         run_once=os.getenv("RUN_ONCE", "false").lower() == "true",
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        like_on_startup=os.getenv("LIKE_ON_STARTUP", "false").lower() == "true",
+        liked_cache_size=liked_cache_size,
     )
 
 
@@ -76,16 +85,51 @@ def setup_logging(level: str) -> None:
     )
 
 
-def load_json_set(path: Path) -> set[int]:
+def _state_path(data_dir: Path) -> Path:
+    return data_dir / "state.json"
+
+
+def load_state(path: Path) -> State:
     try:
-        return {int(item) for item in json.loads(path.read_text())}
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
-        return set()
+        raw = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return State(last_feed_head_id=None, liked_ids=[])
+
+    liked = raw.get("liked_ids", []) if isinstance(raw, dict) else []
+    head = raw.get("last_feed_head_id") if isinstance(raw, dict) else None
+
+    liked_ids: list[int] = []
+    for item in liked:
+        if isinstance(item, int):
+            liked_ids.append(item)
+        elif isinstance(item, str) and item.isdigit():
+            liked_ids.append(int(item))
+
+    if isinstance(head, str) and head.isdigit():
+        head = int(head)
+    if not isinstance(head, int):
+        head = None
+
+    return State(last_feed_head_id=head, liked_ids=liked_ids)
 
 
-def save_json_set(path: Path, values: set[int]) -> None:
+def save_state(path: Path, state: State, liked_cache_size: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sorted(values)))
+
+    # Keep only the latest N liked IDs to bound file growth.
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for activity_id in reversed(state.liked_ids):
+        if activity_id in seen:
+            continue
+        seen.add(activity_id)
+        deduped.append(activity_id)
+        if len(deduped) >= liked_cache_size:
+            break
+    deduped.reverse()
+    state.liked_ids = deduped
+
+    path.write_text(json.dumps(asdict(state), indent=2))
 
 
 def append_history(path: Path, entry: dict) -> None:
@@ -122,9 +166,6 @@ def _is_retriable_login_error(exc: Exception) -> bool:
 def login_with_retry(config: Config) -> None:
     for attempt, delay in enumerate(LOGIN_BACKOFF_SECONDS, start=1):
         try:
-            # garth.login performs cookie exchange, sign-in page retrieval, and form post.
-            # Keep all of that behind controlled retries so temporary SSO failures do not
-            # crash-loop the process.
             garth.login(config.email, config.password)
             garth.save(str(config.token_store))
             logging.info("Login successful and tokens saved")
@@ -151,7 +192,6 @@ def login_with_retry(config: Config) -> None:
                 )
             time.sleep(delay)
 
-    # Final attempt after backoff schedule is exhausted.
     garth.login(config.email, config.password)
     garth.save(str(config.token_store))
     logging.info("Login successful and tokens saved")
@@ -167,23 +207,30 @@ def ensure_login(config: Config) -> None:
         logging.info("Token resume failed; logging in with credentials")
         login_with_retry(config)
 
+
 def _looks_like_activity(item: object) -> bool:
     if not isinstance(item, dict):
         return False
-    activity_id = item.get("activityId")
-    return isinstance(activity_id, int) or str(activity_id).isdigit()
+    if _activity_id(item) is not None:
+        return True
+    nested = item.get("activity")
+    return isinstance(nested, dict) and _activity_id(nested) is not None
+
+
+def _activity_id(activity: dict) -> int | None:
+    for key in ("activityId", "id", "activity_id"):
+        value = activity.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
 
 
 def _extract_activities(payload: object) -> list[dict]:
     def _extract_from_feed_entry(entry: dict) -> list[dict]:
         nested: list[dict] = []
-        for nested_key in (
-            "activity",
-            "activityDTO",
-            "activitySummary",
-            "entity",
-            "latestActivity",
-        ):
+        for nested_key in ("activity", "activityDTO", "activitySummary", "entity", "latestActivity", "item"):
             nested_item = entry.get(nested_key)
             if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
                 nested.append(nested_item)
@@ -220,7 +267,6 @@ def _extract_activities(payload: object) -> list[dict]:
                 if nested:
                     return nested
 
-        # Recursive fallback to handle unknown wrapper shapes.
         recursive: list[dict] = []
         for value in payload.values():
             recursive.extend(_extract_activities(value))
@@ -235,40 +281,33 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
 
     def _get_modern_proxy(endpoint: str) -> object:
-        return garth.client.request(
+        response = garth.client.request(
             "GET",
             "connect",
             f"/modern/proxy{endpoint}",
             params={"start": 0, "limit": limit},
-        ).json()
+        )
+        try:
+            return response.json()
+        except JSONDecodeError:
+            body_preview = response.text[:160].replace("\n", " ")
+            raise ValueError(
+                f"modern/proxy returned non-JSON (status={response.status_code} body='{body_preview}')"
+            ) from None
 
     for endpoint in endpoints:
-        strategies = (
-            ("connectapi", _get_connectapi),
-            ("modern/proxy", _get_modern_proxy),
-        )
-        for strategy_name, strategy in strategies:
+        for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
             try:
                 payload = strategy(endpoint)
             except Exception as exc:
-                logging.warning(
-                    "Feed endpoint '%s' via %s failed: %s",
-                    endpoint,
-                    strategy_name,
-                    exc,
-                )
+                logging.warning("Feed endpoint '%s' via %s failed: %s", endpoint, strategy_name, exc)
                 continue
 
             activities = _extract_activities(payload)
             if activities:
-                logging.info(
-                    "Using feed endpoint '%s' via %s (activities=%s)",
-                    endpoint,
-                    strategy_name,
-                    len(activities),
-                )
+                logging.info("Using feed endpoint '%s' via %s (activities=%s)", endpoint, strategy_name, len(activities))
                 return activities
-
+            payload_type = type(payload).__name__
             if isinstance(payload, dict):
                 logging.warning(
                     "Feed endpoint '%s' via %s returned 0 activities; payload keys=%s",
@@ -281,38 +320,40 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
                     "Feed endpoint '%s' via %s returned 0 activities; payload type=%s",
                     endpoint,
                     strategy_name,
-                    type(payload).__name__,
+                    payload_type,
                 )
 
     return []
 
 
-
-
-def _activity_id(activity: dict) -> int | None:
-    value = activity.get("activityId")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
-
-def iter_targets(activities: Iterable[dict], mode: str, already_liked: set[int]) -> list[dict]:
-    if mode == "last10":
-        return list(activities)
-
+def _filter_likeable(activities: Iterable[dict], liked_ids: set[int]) -> list[dict]:
     targets: list[dict] = []
     for activity in activities:
         activity_id = _activity_id(activity)
         if activity_id is None:
             continue
         activity["activityId"] = activity_id
-        if activity_id in already_liked:
+        if activity_id in liked_ids:
             continue
         if activity.get("userKudoed", False):
             continue
         targets.append(activity)
     return targets
+
+
+def _new_items_since_marker(activities: list[dict], marker_id: int | None) -> list[dict]:
+    if not activities:
+        return []
+    if marker_id is None:
+        return []
+
+    for idx, activity in enumerate(activities):
+        if _activity_id(activity) == marker_id:
+            return activities[:idx]
+
+    # Marker missing means the feed moved beyond current FEED_LIMIT.
+    # Returning all keeps the bot from missing new activities.
+    return activities
 
 
 def like_activity(activity: dict) -> bool:
@@ -321,37 +362,47 @@ def like_activity(activity: dict) -> bool:
         return False
 
     try:
-        garth.client.connectapi(
-            CONNECT_API_KUDOS.format(activity_id=activity_id),
-            method="PUT",
-        )
+        garth.client.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
         return True
     except GarthHTTPError as exc:
         logging.warning("Failed to like activity %s: %s", activity_id, exc)
         return False
 
 
-def run_cycle(config: Config, liked_path: Path, history_path: Path, seen_path: Path) -> tuple[int, int]:
+def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int, int]:
+    state = load_state(state_path)
     feed = fetch_feed(config.feed_endpoints, config.feed_limit)
     logging.info("Fetched %s activities from feed", len(feed))
 
-    liked_ids = load_json_set(liked_path)
-    seen_ids = load_json_set(seen_path)
+    feed = [item for item in feed if _activity_id(item) is not None]
+    if not feed:
+        return 0, 0
 
-    candidates = [a for a in iter_targets(feed, config.mode, liked_ids) if _activity_id(a) is not None]
+    old_marker = state.last_feed_head_id
+    new_marker = _activity_id(feed[0])
 
-    # In "new" mode, only process activities not seen in previous cycle.
-    if config.mode == "new":
-        candidates = [a for a in candidates if a["activityId"] not in seen_ids]
+    if old_marker is None and not config.like_on_startup:
+        state.last_feed_head_id = new_marker
+        save_state(state_path, state, config.liked_cache_size)
+        logging.info("Initialized feed marker to %s (LIKE_ON_STARTUP=false, no likes sent)", new_marker)
+        return 0, 0
+
+    if old_marker is None and config.like_on_startup:
+        new_feed_items = feed
+    else:
+        new_feed_items = _new_items_since_marker(feed, old_marker)
+
+    liked_set = set(state.liked_ids)
+    targets = _filter_likeable(new_feed_items, liked_set)
 
     successes = 0
-    for activity in candidates:
+    for activity in reversed(targets):
         activity_id = activity["activityId"]
         owner = activity.get("ownerDisplayName", "unknown")
         name = activity.get("activityName", "unnamed")
 
         if like_activity(activity):
-            liked_ids.add(activity_id)
+            state.liked_ids.append(activity_id)
             successes += 1
             append_history(
                 history_path,
@@ -364,40 +415,36 @@ def run_cycle(config: Config, liked_path: Path, history_path: Path, seen_path: P
             )
             logging.info("Liked activity %s | %s | %s", activity_id, owner, name)
 
-    current_feed_ids = {activity_id for a in feed if (activity_id := _activity_id(a)) is not None}
-    seen_ids.update(current_feed_ids)
-
-    save_json_set(liked_path, liked_ids)
-    save_json_set(seen_path, seen_ids)
-
-    return len(candidates), successes
+    state.last_feed_head_id = new_marker
+    save_state(state_path, state, config.liked_cache_size)
+    return len(targets), successes
 
 
 def main() -> None:
     config = build_config()
     setup_logging(config.log_level)
 
-    liked_path = config.data_dir / "liked_activities.json"
+    state_path = _state_path(config.data_dir)
     history_path = config.data_dir / "history.json"
-    seen_path = config.data_dir / "seen_activities.json"
 
-    logging.info("Starting Garmin auto-like bot | mode=%s | feed_limit=%s", config.mode, config.feed_limit)
+    logging.info(
+        "Starting Garmin auto-like bot | feed_limit=%s | interval=%ss | like_on_startup=%s",
+        config.feed_limit,
+        config.check_interval_seconds,
+        config.like_on_startup,
+    )
 
     while True:
         try:
             ensure_login(config)
             break
         except Exception as exc:
-            logging.exception(
-                "Initial authentication failed; retrying in %ss: %s",
-                STARTUP_AUTH_RETRY_SECONDS,
-                exc,
-            )
+            logging.exception("Initial authentication failed; retrying in %ss: %s", STARTUP_AUTH_RETRY_SECONDS, exc)
             time.sleep(STARTUP_AUTH_RETRY_SECONDS)
 
     while True:
         try:
-            attempted, liked = run_cycle(config, liked_path, history_path, seen_path)
+            attempted, liked = run_cycle(config, state_path, history_path)
             logging.info("Cycle complete: attempted=%s liked=%s", attempted, liked)
         except Exception as exc:
             logging.exception("Cycle failed: %s", exc)
