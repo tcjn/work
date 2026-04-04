@@ -227,10 +227,19 @@ def _activity_id(activity: dict) -> int | None:
     return None
 
 
+def _activity_id(activity: dict) -> int | None:
+    value = activity.get("activityId")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 def _extract_activities(payload: object) -> list[dict]:
     def _extract_from_feed_entry(entry: dict) -> list[dict]:
         nested: list[dict] = []
-        for nested_key in ("activity", "activityDTO", "activitySummary", "entity", "latestActivity", "item"):
+        for nested_key in ("activity", "activityDTO", "activitySummary", "entity", "latestActivity"):
             nested_item = entry.get(nested_key)
             if isinstance(nested_item, dict) and _looks_like_activity(nested_item):
                 nested.append(nested_item)
@@ -307,21 +316,6 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
             if activities:
                 logging.info("Using feed endpoint '%s' via %s (activities=%s)", endpoint, strategy_name, len(activities))
                 return activities
-            payload_type = type(payload).__name__
-            if isinstance(payload, dict):
-                logging.warning(
-                    "Feed endpoint '%s' via %s returned 0 activities; payload keys=%s",
-                    endpoint,
-                    strategy_name,
-                    sorted(payload.keys())[:12],
-                )
-            else:
-                logging.warning(
-                    "Feed endpoint '%s' via %s returned 0 activities; payload type=%s",
-                    endpoint,
-                    strategy_name,
-                    payload_type,
-                )
 
     return []
 
