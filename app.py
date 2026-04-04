@@ -247,6 +247,23 @@ def _activity_id(activity: dict) -> int | None:
     return None
 
 
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _already_liked_by_me(activity: dict) -> bool:
+    for key in ("userKudoed", "viewerHasLiked", "hasLiked", "likedByUser"):
+        if key in activity and _as_bool(activity.get(key)):
+            return True
+    return False
+
+
 def _extract_activities(payload: object) -> list[dict]:
     def _extract_from_feed_entry(entry: dict) -> list[dict]:
         nested: list[dict] = []
@@ -353,7 +370,7 @@ def _filter_likeable(activities: Iterable[dict], liked_ids: set[int]) -> list[di
         activity["activityId"] = activity_id
         if activity_id in liked_ids:
             continue
-        if activity.get("userKudoed", False):
+        if _already_liked_by_me(activity):
             continue
         targets.append(activity)
     return targets
@@ -415,6 +432,14 @@ def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int
 
     liked_set = set(state.liked_ids)
     targets = _filter_likeable(new_feed_items, liked_set)
+    if new_feed_items and not targets:
+        sample_keys = sorted(str(k) for k in new_feed_items[0].keys())
+        logging.info(
+            "No likeable activities after filtering (feed_items=%s, cached_liked_ids=%s, sample_keys=%s)",
+            len(new_feed_items),
+            len(liked_set),
+            sample_keys,
+        )
 
     successes = 0
     for activity in reversed(targets):
