@@ -21,6 +21,10 @@ LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
 
 
+class AuthExpiredError(RuntimeError):
+    """Raised when Garmin auth/session is no longer valid for feed requests."""
+
+
 @dataclass(frozen=True)
 class Config:
     email: str
@@ -227,15 +231,6 @@ def _activity_id(activity: dict) -> int | None:
     return None
 
 
-def _activity_id(activity: dict) -> int | None:
-    value = activity.get("activityId")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
-
-
 def _extract_activities(payload: object) -> list[dict]:
     def _extract_from_feed_entry(entry: dict) -> list[dict]:
         nested: list[dict] = []
@@ -286,6 +281,16 @@ def _extract_activities(payload: object) -> list[dict]:
 
 
 def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
+    auth_failures = 0
+    attempts = 0
+
+    def _is_auth_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        if any(marker in text for marker in ("sign in", "sso/logout", "forbidden", "unauthorized")):
+            return True
+        status = _extract_status_code(exc)
+        return status in (401, 403)
+
     def _get_connectapi(endpoint: str) -> object:
         return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
 
@@ -300,15 +305,18 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
             return response.json()
         except JSONDecodeError:
             body_preview = response.text[:160].replace("\n", " ")
-            raise ValueError(
+            raise AuthExpiredError(
                 f"modern/proxy returned non-JSON (status={response.status_code} body='{body_preview}')"
             ) from None
 
     for endpoint in endpoints:
         for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
+            attempts += 1
             try:
                 payload = strategy(endpoint)
             except Exception as exc:
+                if _is_auth_failure(exc):
+                    auth_failures += 1
                 logging.warning("Feed endpoint '%s' via %s failed: %s", endpoint, strategy_name, exc)
                 continue
 
@@ -316,6 +324,9 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
             if activities:
                 logging.info("Using feed endpoint '%s' via %s (activities=%s)", endpoint, strategy_name, len(activities))
                 return activities
+
+    if attempts > 0 and auth_failures == attempts:
+        raise AuthExpiredError("All feed endpoints failed due to authentication/session errors")
 
     return []
 
