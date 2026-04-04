@@ -411,19 +411,56 @@ def like_activity(activity: dict) -> bool:
     if activity_id is None:
         return False
 
+    request_attempts: list[tuple[str, Callable[[str, str], object], tuple[str, ...]]] = [
+        ("connectapi", lambda path, method: api.connectapi(path, method=method), ("",)),
+    ]
+
+    # Some garminconnect versions expose the lower-level client only.
+    # Use it directly to reach connect.garmin.com endpoints and modern proxy routes.
+    client = getattr(api, "client", None)
+    client_request = getattr(client, "request", None)
+    if callable(client_request):
+        request_attempts.append(
+            (
+                "client.connect",
+                lambda path, method: client_request(method, "connect", path),
+                ("", "/modern/proxy"),
+            )
+        )
+
+    methods = ("PUT", "POST")
+
     for endpoint in CONNECT_API_KUDOS_ENDPOINTS:
-        path = endpoint.format(activity_id=activity_id)
-        try:
-            api.connectapi(path, method="PUT")
-            return True
-        except Exception as exc:
-            status = _extract_status_code(exc)
-            logging.warning("Failed to like activity %s via %s: %s", activity_id, path, exc)
-            if status in (401, 403):
-                raise AuthExpiredError(f"Kudos request unauthorized for {activity_id}") from exc
-            if status == 404:
-                continue
-            return False
+        base_path = endpoint.format(activity_id=activity_id)
+        for strategy_name, request_fn, prefixes in request_attempts:
+            for prefix in prefixes:
+                request_path = f"{prefix}{base_path}"
+                for method in methods:
+                    try:
+                        request_fn(request_path, method=method)
+                        logging.info(
+                            "Liked activity %s via %s %s %s",
+                            activity_id,
+                            strategy_name,
+                            method,
+                            request_path,
+                        )
+                        return True
+                    except Exception as exc:
+                        status = _extract_status_code(exc)
+                        logging.warning(
+                            "Failed to like activity %s via %s %s %s: %s",
+                            activity_id,
+                            strategy_name,
+                            method,
+                            request_path,
+                            exc,
+                        )
+                        if status in (401, 403):
+                            raise AuthExpiredError(f"Kudos request unauthorized for {activity_id}") from exc
+                        if status == 404:
+                            continue
+                        return False
 
     return False
 
