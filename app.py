@@ -21,13 +21,9 @@ CONNECT_API_FEEDS = (
     "/activitylist-service/activities/search/activities",
     "/activitylist-service/activities/subscribed",
 )
-CONNECT_API_KUDOS_REQUESTS = (
-    ("PUT", "/activity-service/activity/{activity_id}/kudos"),
-    ("POST", "/activity-service/activity/{activity_id}/kudos"),
-    ("PUT", "/kudos-service/kudos/activity/{activity_id}"),
-    ("POST", "/kudos-service/kudos/activity/{activity_id}"),
-    ("PUT", "/kudos-service/v1/activities/{activity_id}/kudos"),
-    ("POST", "/kudos-service/v1/activities/{activity_id}/kudos"),
+CONNECT_API_KUDOS_ENDPOINTS = (
+    "/activity-service/activity/{activity_id}/kudos",
+    "/kudos-service/kudos/activity/{activity_id}",
 )
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
@@ -415,23 +411,20 @@ def like_activity(activity: dict) -> bool:
     if activity_id is None:
         return False
 
-    errors: list[str] = []
-    for method, endpoint in CONNECT_API_KUDOS_REQUESTS:
+    for endpoint in CONNECT_API_KUDOS_ENDPOINTS:
         path = endpoint.format(activity_id=activity_id)
         try:
-            api.connectapi(path, method=method)
-            logging.info("Liked activity %s via %s %s", activity_id, method, path)
+            api.connectapi(path, method="PUT")
             return True
         except Exception as exc:
             status = _extract_status_code(exc)
-            errors.append(f"{method} {path} -> {exc}")
+            logging.warning("Failed to like activity %s via %s: %s", activity_id, path, exc)
             if status in (401, 403):
                 raise AuthExpiredError(f"Kudos request unauthorized for {activity_id}") from exc
             if status == 404:
                 continue
             return False
 
-    logging.warning("Failed to like activity %s after %s attempts: %s", activity_id, len(errors), " | ".join(errors))
     return False
 
 
