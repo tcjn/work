@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -20,7 +21,10 @@ CONNECT_API_FEEDS = (
     "/activitylist-service/activities/search/activities",
     "/activitylist-service/activities/subscribed",
 )
-CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
+CONNECT_API_KUDOS_ENDPOINTS = (
+    "/activity-service/activity/{activity_id}/kudos",
+    "/kudos-service/kudos/activity/{activity_id}",
+)
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
 api: Garmin | None = None
@@ -162,6 +166,10 @@ def _extract_status_code(exc: Exception) -> int | None:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         return status_code
+
+    match = re.search(r"\b([45]\d{2})\b", str(exc))
+    if match:
+        return int(match.group(1))
 
     return None
 
@@ -403,12 +411,21 @@ def like_activity(activity: dict) -> bool:
     if activity_id is None:
         return False
 
-    try:
-        api.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
-        return True
-    except GarminConnectConnectionError as exc:
-        logging.warning("Failed to like activity %s: %s", activity_id, exc)
-        return False
+    for endpoint in CONNECT_API_KUDOS_ENDPOINTS:
+        path = endpoint.format(activity_id=activity_id)
+        try:
+            api.connectapi(path, method="PUT")
+            return True
+        except Exception as exc:
+            status = _extract_status_code(exc)
+            logging.warning("Failed to like activity %s via %s: %s", activity_id, path, exc)
+            if status in (401, 403):
+                raise AuthExpiredError(f"Kudos request unauthorized for {activity_id}") from exc
+            if status == 404:
+                continue
+            return False
+
+    return False
 
 
 def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int, int]:
