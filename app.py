@@ -339,10 +339,6 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         except JSONDecodeError as exc:
             raise AuthExpiredError("modern/proxy returned non-JSON") from exc
 
-    strategies: list[tuple[str, Callable[[str], object]]] = [("connectapi", _get_connectapi)]
-    if hasattr(api, "connectwebproxy"):
-        strategies.append(("modern/proxy", _get_modern_proxy))
-
     for endpoint in endpoints:
         for strategy_name, strategy in strategies:
             attempts += 1
