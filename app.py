@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import requests
 from garminconnect import (
@@ -17,8 +17,8 @@ from garminconnect import (
 )
 
 CONNECT_API_FEEDS = (
-    "/activitylist-service/activities/subscribed",
     "/activitylist-service/activities/search/activities",
+    "/activitylist-service/activities/subscribed",
 )
 CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
@@ -340,7 +340,7 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
             raise AuthExpiredError("modern/proxy returned non-JSON") from exc
 
     for endpoint in endpoints:
-        for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
+        for strategy_name, strategy in strategies:
             attempts += 1
             try:
                 payload = strategy(endpoint)
@@ -426,6 +426,9 @@ def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int
         return 0, 0
 
     if old_marker is None and config.like_on_startup:
+        new_feed_items = feed
+    elif config.like_on_startup and not state.liked_ids:
+        # Recovery path: if marker exists but no likes were ever persisted, process visible feed once.
         new_feed_items = feed
     else:
         new_feed_items = _new_items_since_marker(feed, old_marker)
