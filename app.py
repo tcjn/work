@@ -331,8 +331,6 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         return api.connectapi(endpoint, params={"start": 0, "limit": limit})
 
     def _get_modern_proxy(endpoint: str) -> object:
-        if not hasattr(api, "connectwebproxy"):
-            raise RuntimeError("python-garminconnect client does not expose connectwebproxy")
         try:
             return api.connectwebproxy(
                 f"/modern/proxy{endpoint}",
