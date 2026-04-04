@@ -8,9 +8,13 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Iterable
 
-import garth
 import requests
-from garth.exc import GarthHTTPError
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 CONNECT_API_FEEDS = (
     "/activitylist-service/activities/subscribed",
@@ -19,6 +23,7 @@ CONNECT_API_FEEDS = (
 CONNECT_API_KUDOS = "/activity-service/activity/{activity_id}/kudos"
 LOGIN_BACKOFF_SECONDS = (15, 30, 60, 120, 240)
 STARTUP_AUTH_RETRY_SECONDS = 30
+api: Garmin | None = None
 
 
 class AuthExpiredError(RuntimeError):
@@ -164,14 +169,23 @@ def _extract_status_code(exc: Exception) -> int | None:
 def _is_retriable_login_error(exc: Exception) -> bool:
     if _extract_status_code(exc) == 429:
         return True
-    return isinstance(exc, (GarthHTTPError, requests.RequestException))
+    return isinstance(
+        exc,
+        (
+            GarminConnectAuthenticationError,
+            GarminConnectConnectionError,
+            GarminConnectTooManyRequestsError,
+            requests.RequestException,
+        ),
+    )
 
 
 def login_with_retry(config: Config) -> None:
+    global api
     for attempt, delay in enumerate(LOGIN_BACKOFF_SECONDS, start=1):
         try:
-            garth.login(config.email, config.password)
-            garth.save(str(config.token_store))
+            api = Garmin(email=config.email, password=config.password)
+            api.login(str(config.token_store))
             logging.info("Login successful and tokens saved")
             return
         except Exception as exc:
@@ -196,16 +210,18 @@ def login_with_retry(config: Config) -> None:
                 )
             time.sleep(delay)
 
-    garth.login(config.email, config.password)
-    garth.save(str(config.token_store))
+    api = Garmin(email=config.email, password=config.password)
+    api.login(str(config.token_store))
     logging.info("Login successful and tokens saved")
 
 
 def ensure_login(config: Config) -> None:
+    global api
     config.token_store.mkdir(parents=True, exist_ok=True)
     try:
-        garth.resume(str(config.token_store))
-        garth.client.connectapi("/userprofile-service/userprofile/personal-information")
+        api = Garmin()
+        api.login(str(config.token_store))
+        api.connectapi("/userprofile-service/userprofile/personal-information")
         logging.info("Reused saved Garmin tokens")
     except Exception:
         logging.info("Token resume failed; logging in with credentials")
@@ -229,6 +245,23 @@ def _activity_id(activity: dict) -> int | None:
         if isinstance(value, str) and value.isdigit():
             return int(value)
     return None
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _already_liked_by_me(activity: dict) -> bool:
+    for key in ("userKudoed", "viewerHasLiked", "hasLiked", "likedByUser"):
+        if key in activity and _as_bool(activity.get(key)):
+            return True
+    return False
 
 
 def _extract_activities(payload: object) -> list[dict]:
@@ -281,6 +314,9 @@ def _extract_activities(payload: object) -> list[dict]:
 
 
 def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
+    if api is None:
+        raise RuntimeError("Garmin API client is not initialized")
+
     auth_failures = 0
     attempts = 0
 
@@ -292,22 +328,18 @@ def fetch_feed(endpoints: tuple[str, ...], limit: int) -> list[dict]:
         return status in (401, 403)
 
     def _get_connectapi(endpoint: str) -> object:
-        return garth.client.connectapi(endpoint, params={"start": 0, "limit": limit})
+        return api.connectapi(endpoint, params={"start": 0, "limit": limit})
 
     def _get_modern_proxy(endpoint: str) -> object:
-        response = garth.client.request(
-            "GET",
-            "connect",
-            f"/modern/proxy{endpoint}",
-            params={"start": 0, "limit": limit},
-        )
+        if not hasattr(api, "connectwebproxy"):
+            raise RuntimeError("python-garminconnect client does not expose connectwebproxy")
         try:
-            return response.json()
-        except JSONDecodeError:
-            body_preview = response.text[:160].replace("\n", " ")
-            raise AuthExpiredError(
-                f"modern/proxy returned non-JSON (status={response.status_code} body='{body_preview}')"
-            ) from None
+            return api.connectwebproxy(
+                f"/modern/proxy{endpoint}",
+                params={"start": 0, "limit": limit},
+            )
+        except JSONDecodeError as exc:
+            raise AuthExpiredError("modern/proxy returned non-JSON") from exc
 
     for endpoint in endpoints:
         for strategy_name, strategy in (("connectapi", _get_connectapi), ("modern/proxy", _get_modern_proxy)):
@@ -340,7 +372,7 @@ def _filter_likeable(activities: Iterable[dict], liked_ids: set[int]) -> list[di
         activity["activityId"] = activity_id
         if activity_id in liked_ids:
             continue
-        if activity.get("userKudoed", False):
+        if _already_liked_by_me(activity):
             continue
         targets.append(activity)
     return targets
@@ -362,14 +394,17 @@ def _new_items_since_marker(activities: list[dict], marker_id: int | None) -> li
 
 
 def like_activity(activity: dict) -> bool:
+    if api is None:
+        raise RuntimeError("Garmin API client is not initialized")
+
     activity_id = _activity_id(activity)
     if activity_id is None:
         return False
 
     try:
-        garth.client.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
+        api.connectapi(CONNECT_API_KUDOS.format(activity_id=activity_id), method="PUT")
         return True
-    except GarthHTTPError as exc:
+    except GarminConnectConnectionError as exc:
         logging.warning("Failed to like activity %s: %s", activity_id, exc)
         return False
 
@@ -399,6 +434,14 @@ def run_cycle(config: Config, state_path: Path, history_path: Path) -> tuple[int
 
     liked_set = set(state.liked_ids)
     targets = _filter_likeable(new_feed_items, liked_set)
+    if new_feed_items and not targets:
+        sample_keys = sorted(str(k) for k in new_feed_items[0].keys())
+        logging.info(
+            "No likeable activities after filtering (feed_items=%s, cached_liked_ids=%s, sample_keys=%s)",
+            len(new_feed_items),
+            len(liked_set),
+            sample_keys,
+        )
 
     successes = 0
     for activity in reversed(targets):
