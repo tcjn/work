@@ -5,12 +5,12 @@ services:
     environment:
       - GARMIN_EMAIL=${GARMIN_EMAIL}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
-      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-300}
-      - FEED_LIMIT=${FEED_LIMIT:-10}
-      # LIKE_MODE options:
-      # - new: only like activities that newly appear in feed between checks
-      # - last10: always try to like last FEED_LIMIT activities
-      - LIKE_MODE=${LIKE_MODE:-new}
+      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-120}
+      - FEED_LIMIT=${FEED_LIMIT:-25}
+      # LIKE_ON_STARTUP=true will like already-visible feed items on first run.
+      # Keep false to only like items that appear after the bot has started.
+      - LIKE_ON_STARTUP=${LIKE_ON_STARTUP:-false}
+      - LIKED_CACHE_SIZE=${LIKED_CACHE_SIZE:-5000}
       # Set RUN_ONCE=true to process one cycle and exit (useful for cron/jobs)
       - RUN_ONCE=${RUN_ONCE:-false}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
